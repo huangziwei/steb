@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="2200" viewBox="0 0 1440 2200">
+  <!-- Steb's home-screen tile.
+       Ground is Standard Ebooks' own theme colour (#394451, from their site's
+       meta tags) — a nod rather than a claim; the wordmark is Steb's.
+
+       Flat colour, one motif, no gradients: the tile is rasterised small and
+       drawn on e-ink, where fine detail and tonal steps disappear. On a
+       grayscale panel this collapses to ~66 vs ~248 luma, so the contrast
+       survives the luma path that KOA2 and Scribe take.
+
+       Motif: lines of type tapering into an arrowhead — text coming down onto
+       the device, which is the whole app in one shape. -->
+  <rect width="1440" height="2200" fill="#394451"/>
+
+  <!-- Even 120px steps, and the arrowhead only 60px wider than the last bar.
+       so the head reads as the end of the stack rather than a separate object
+       sitting under it. -->
+  <g fill="#faf8f5">
+    <rect x="270" y="460" width="900" height="46" rx="23"/>
+    <rect x="330" y="608" width="780" height="46" rx="23"/>
+    <rect x="390" y="756" width="660" height="46" rx="23"/>
+    <rect x="450" y="904" width="540" height="46" rx="23"/>
+    <rect x="510" y="1052" width="420" height="46" rx="23"/>
+  </g>
+
+  <path d="M 480 1170 L 960 1170 L 720 1430 Z" fill="#faf8f5"/>
+
+  <!-- Hairline above the wordmark, the one piece of editorial furniture. -->
+  <rect x="460" y="1716" width="520" height="3" fill="#faf8f5" opacity="0.5"/>
+
+  <!-- Letter-spacing adds a trailing advance after the final glyph, so
+       text-anchor="middle" centres the glyphs *plus* that gap and the word
+       lands left of true centre. Both x values are nudged right by half the
+       spacing to compensate. -->
+  <text x="750" y="1868" font-family="Baskerville" font-weight="600"
+        font-size="176" letter-spacing="60" fill="#faf8f5"
+        text-anchor="middle">STEB</text>
+  <text x="729" y="1985" font-family="Baskerville" font-weight="600"
+        font-size="50" letter-spacing="18" fill="#faf8f5" opacity="0.72"
+        text-anchor="middle">STANDARD EBOOKS</text>
+</svg>

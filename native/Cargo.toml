@@ -1,0 +1,71 @@
+[package]
+name = "steb-native"
+version.workspace = true
+license.workspace = true
+edition = "2024"
+publish = false
+
+[lib]
+name = "steb_native"
+path = "src/lib.rs"
+
+[[bin]]
+name = "steb-native"
+path = "src/main.rs"
+
+[dependencies]
+# libc: raw open/ioctl for the framebuffer and evdev touch/button devices.
+# Pure Rust, no C build script — keeps the rust-lld cross path working.
+libc = "0.2"
+# anyhow: error propagation with context strings in the on-device run loop.
+anyhow = "1"
+# ureq: small sync HTTP client. standardebooks.org is HTTPS-only with HSTS, so
+# TLS is mandatory.
+#
+# `rustls-no-provider` is load-bearing and the reason this is ureq 3 rather than
+# 2. ureq 2's only TLS feature pulls rustls *with* ring, and since Cargo unifies
+# features, ring's C build script then runs whether or not a byte of it is
+# called — which breaks the pure-Rust rust-lld cross path and would force the
+# whole build through zig. ureq 3 splits the provider out, so we take the
+# plumbing and supply our own crypto below.
+ureq = { version = "3", default-features = false, features = [
+    "rustls-no-provider",
+    "rustls-webpki-roots",
+    "gzip",
+] }
+# rustls with no provider features of its own — same reason. `tls12` is off:
+# standardebooks.org negotiates TLS 1.3, so 1.2 is dead weight and a wider
+# attack surface for a client that only ever talks to one host.
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+# The crypto provider: RustCrypto's, so the whole graph stays pure Rust and the
+# static musl cross-link keeps working with no C toolchain anywhere.
+#
+# Pinned to git because the crates.io release (0.0.2-alpha, April 2024) is far
+# behind the repo, which is current. This is glue rather than cryptography — it
+# maps the `aes-gcm`, `chacha20poly1305`, `p256`, `rsa`, `*-dalek` and `sha2`
+# crates onto rustls' provider traits — and it lives under the RustCrypto org
+# itself. Not independently audited; acceptable here because the only secret on
+# the wire is which public-domain book someone is reading, and a download is
+# verified structurally before it is committed (see se::download).
+rustls-rustcrypto = { git = "https://github.com/RustCrypto/rustls-rustcrypto", rev = "7b44a2de957b6596d267a920d3aec0d4137defb1" }
+# webpki-roots: bundled Mozilla root store. The device's own CA bundle is years
+# stale and would reject Let's Encrypt's current chain, so we ship our own and
+# never consult the system store.
+webpki-roots = "1"
+# serde + serde_json: the catalogue cache (book records keyed by SE path).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# ab_glyph: TTF rasterizer over the Kindle's own bundled faces, so no font
+# ships with the extension. Outlines a glyph when asked rather than parsing
+# every glyph in the cmap up front — the difference decides whether a CJK face
+# fits in RAM at all on a 512 MB device.
+ab_glyph = "0.2"
+# image: cover JPEG/PNG decode + resize for the grid. Feature-gated to the two
+# formats SE serves; all sub-deps are pure Rust.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# x11rb: pure-Rust X11 client speaking the wire protocol over the socket — no
+# libxcb, so the cross link stays intact. Makes Steb a real WM-managed window
+# that the framework composites and tears down cleanly.
+# NB: NO `allow-unsafe-code` feature — it pulls `as-raw-xcb-connection`, which
+# links the system libxcb and breaks the static musl cross-link.
+x11rb = { version = "0.13", default-features = false }
