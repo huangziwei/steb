@@ -2,6 +2,8 @@
 
 Steb is an unofficial [Standard Ebooks](https://standardebooks.org) frontend on a jailbroken Kindle. 
 
+Tested on Kindle Colorsoft (5.18.0.2).
+
 ## Build
 
 ```
