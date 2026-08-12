@@ -38,7 +38,25 @@ if ! command -v rust-lld >/dev/null 2>&1; then
     exit 1
 fi
 
-echo "==> building $TARGET"
+# Single source of truth for the version: [workspace.package] in Cargo.toml.
+# Everything in the binary picks it up through CARGO_PKG_VERSION — the user
+# agent, the startup log line — but KUAL reads config.xml, which cargo knows
+# nothing about. Stamp it here so the two cannot drift; a hand-maintained copy
+# would sit at the old number for exactly as long as nobody looked.
+VERSION="$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0}
+                f && /^version *=/{gsub(/[" ]/,""); sub(/^version=/,""); print; exit}' \
+    "$ROOT/Cargo.toml")"
+[ -n "$VERSION" ] || { echo "error: no version in [workspace.package]" >&2; exit 1; }
+
+CONFIG="$ROOT/device/extensions/steb/config.xml"
+if [ -f "$CONFIG" ]; then
+    TMP="$(mktemp)"
+    sed "s|<version>[^<]*</version>|<version>$VERSION</version>|" "$CONFIG" > "$TMP"
+    cat "$TMP" > "$CONFIG"
+    rm -f "$TMP"
+fi
+
+echo "==> building steb $VERSION for $TARGET"
 cargo build --release --target "$TARGET" -p steb-native --bin steb-native
 
 # Named `steb` on device, not `steb-native`: the tile's single-instance guard
