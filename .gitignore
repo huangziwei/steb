@@ -4,8 +4,5 @@
 artifacts/
 /target
 
-# Built artifact staged into the extension by build.sh — never committed.
-device/extensions/steb/bin/steb
-
 # Per-install config. The .example file is the template.
 device/extensions/steb/etc/steb.conf
