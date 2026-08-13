@@ -260,7 +260,7 @@ fn key_rect(kb: &KeyButton) -> MxcfbRect {
 /// The line under the bar is a static prompt, not a live match count: there is
 /// no local corpus to count against, Standard Ebooks has no autocomplete
 /// endpoint, and counting would mean one HTTPS request per letter typed. The
-/// search runs once, on Done.
+/// search runs once, on `[ Search ]`.
 fn draw_band(fb: &mut Framebuffer, renderer: &mut TextRenderer, query: &str, lh: u32) {
     let xres = fb.var.xres;
     searchbar::draw(fb, renderer, query);
@@ -269,7 +269,7 @@ fn draw_band(fb: &mut Framebuffer, renderer: &mut TextRenderer, query: &str, lh:
     let count = if query.trim().is_empty() {
         "Type to search Standard Ebooks".to_string()
     } else {
-        "Tap Done to search".to_string()
+        "Tap Search to run it".to_string()
     };
     let cw = renderer.measure_width(&count);
     let cy = (searchbar::TOP + searchbar::HEIGHT + lh) as i32;
