@@ -29,28 +29,6 @@ if ! rustup target list --installed | grep -qx "$TARGET"; then
     exit 1
 fi
 
-# rust-lld ships inside the toolchain but is not on PATH, and its directory is
-# host-triple-specific, so .cargo/config.toml can only name it bare — TOML has no
-# command substitution. Resolve the absolute path here and hand it to cargo via
-# the per-target linker env var, which overrides that bare name.
-#
-# The alternative — symlinking it into ~/.cargo/bin — is a global mutation to
-# make one repo build, it needs redoing after a `rustup update` reshuffles the
-# bundled tools, and it is unavailable to anyone whose home directory is not
-# writable. Deriving it costs two `rustc` calls.
-HOST="$(rustc -vV | awk '/^host:/ {print $2}')"
-LLD="$(rustc --print sysroot)/lib/rustlib/$HOST/bin/rust-lld"
-if [ ! -x "$LLD" ]; then
-    echo "error: rust-lld not found at $LLD" >&2
-    echo "       it ships with the toolchain; reinstall if this persists:" >&2
-    echo "       fix: rustup toolchain install \"\$(rustup show active-toolchain | cut -d' ' -f1)\" --force" >&2
-    exit 1
-fi
-# CARGO_TARGET_<TRIPLE>_LINKER — triple uppercased with '-' mapped to '_'.
-# Derived from $TARGET so the two cannot drift apart.
-LINKER_ENV="CARGO_TARGET_$(echo "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER"
-export "$LINKER_ENV=$LLD"
-
 # Single source of truth for the version: [workspace.package] in Cargo.toml.
 # Everything in the binary picks it up through CARGO_PKG_VERSION — the user
 # agent, the startup log line — but KUAL reads config.xml, which cargo knows

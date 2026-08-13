@@ -1,7 +1,7 @@
 //! Steb — search Standard Ebooks from the Kindle and download the `.azw3`.
 //!
 //! One screen: a paginated cover grid, with the keyboard, subject filter and
-//! sort picker as blocking overlay sub-loops. Tap a cover and it downloads —
+//! sort picker as blocking overlay sub-loops. Hold a cover and it downloads —
 //! there is no detail page.
 //!
 //! The device layer is Linux-only (`libc::ioctl`'s request argument differs
@@ -25,6 +25,7 @@ mod ui;
 mod wrap;
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use eink::buttons::{Buttons, PageButton};
 use eink::fb::{Framebuffer, MxcfbRect, WAVEFORM_MODE_DU, WAVEFORM_MODE_GC16};
@@ -54,6 +55,50 @@ const LOG_PATH: &str = "/mnt/us/steb.log";
 const FONT_PX: f32 = 32.0;
 /// Headroom above the grid for the search bar.
 const TOP_MARGIN: u32 = searchbar::TOP + searchbar::HEIGHT + 16;
+
+/// How long a cover must be held — without drifting more than [`ARM_SLOP_PX`]
+/// from where the finger landed — before its download arms and fires.
+///
+/// A plain tap used to download, which misfires constantly: the grid is a wall
+/// of covers with nothing else to touch, so every stray brush while reading the
+/// titles started a fetch. The armed cue paints on the cell the instant the
+/// threshold passes and the download starts with it, so the gesture is "hold
+/// until the cover flips", not "hold, then release at the right moment" — an
+/// over-long hold costs nothing and a too-short one is a visible non-event
+/// rather than a silent misclick.
+const ARM_THRESHOLD: Duration = Duration::from_millis(1000);
+/// Max drift (either axis, user-visible px) from the landing point that still
+/// counts as a hold rather than a drag.
+const ARM_SLOP_PX: u32 = 40;
+/// How long the armed cue stays up before the download overlay paints over it,
+/// so the "held long enough" signal is actually seen.
+const ARM_DWELL: Duration = Duration::from_millis(250);
+/// How long the hint after a too-short tap stays up.
+const TOAST_LINGER: Duration = Duration::from_millis(1200);
+
+/// Refresh rect for one grid cell, for the partial updates the press outline and
+/// the armed cue send.
+fn cell_rect(cell_x: i32, cell_y: i32, cell_h: u32) -> MxcfbRect {
+    MxcfbRect {
+        top: cell_y.max(0) as u32,
+        left: cell_x.max(0) as u32,
+        width: grid::CELL_W,
+        height: cell_h,
+    }
+}
+
+/// A cover outlined under a finger, waiting to see whether the press becomes a
+/// hold. Release before [`ARM_THRESHOLD`] is a too-short tap and only shows the
+/// hint; holding past it auto-fires the download from the arm deadline.
+struct Armed {
+    /// Slot on the current page, for redrawing that cell.
+    slot: usize,
+    /// Index into `view.hits`.
+    idx: usize,
+    down_at: Instant,
+    /// Where the finger landed, so drift past [`ARM_SLOP_PX`] can cancel.
+    at: (u32, u32),
+}
 
 /// Write one line to stderr, which `bin/steb.sh` redirects into the log.
 ///
@@ -520,9 +565,30 @@ fn run() -> anyhow::Result<()> {
         }};
     }
 
+    // The cover under the finger, if any.
+    let mut armed: Option<Armed> = None;
+
     loop {
-        match input.next()? {
+        // While a cover is held, wake the loop at the arm instant so the cue can
+        // flip and the download fire on its own. A `Tick` otherwise never
+        // arrives mid-hold: finger micro-jitter keeps `poll` busy.
+        let deadline = armed.as_ref().map(|a| a.down_at + ARM_THRESHOLD);
+        match input.next_deadline(deadline)? {
             InputEvent::Touch(TouchEvent::Up { x, y }) => {
+                // A hold long enough to act already fired from the `Tick` arm and
+                // cleared this, so a cover still armed here was released early.
+                if let Some(a) = armed.take() {
+                    log(format!(
+                        "short tap ({:?}), showing hint",
+                        a.down_at.elapsed()
+                    ));
+                    let dirty = toast::draw(&mut fb, &mut renderer, "Hold cover to download");
+                    fb.send_update(dirty, WAVEFORM_MODE_GC16)?;
+                    std::thread::sleep(TOAST_LINGER);
+                    // Clears both the toast and the outline the press left.
+                    repaint!();
+                    continue;
+                }
                 // Search bar first — it sits above the grid.
                 if let Some(tap) = searchbar::hit(x, y, fb.var.xres, !view.query.is_empty()) {
                     match tap {
@@ -607,35 +673,30 @@ fn run() -> anyhow::Result<()> {
                     continue;
                 }
 
-                // A cell — arm cue first so the tap feels instant, then work.
-                if let Some(slot) = layout.cell_at_tap(x, y, view.hits.len()) {
+                // A lift on a cover does nothing: downloading is the hold, armed
+                // on `Down` and fired from the arm deadline in `Tick`.
+            }
+            InputEvent::Touch(TouchEvent::Down { x, y }) => {
+                // Outline the cover so the press is acknowledged immediately;
+                // whether it downloads is decided by how long the finger stays.
+                if searchbar::hit(x, y, fb.var.xres, !view.query.is_empty()).is_none()
+                    && pager::hit(x, y, fb.var.xres, fb.var.yres, total_pages).is_none()
+                    && let Some(slot) = layout.cell_at_tap(x, y, view.hits.len())
+                {
                     let idx = page * layout.page_size() + slot;
-                    let Some(hit) = view.hits.get(idx).cloned() else {
-                        continue;
-                    };
                     let (cx, cy) = layout.cell_xy(slot);
-                    grid::draw_arm_cue(&mut fb, cx, cy, layout.cell_h);
-                    fb.send_update(
-                        MxcfbRect {
-                            top: cy.max(0) as u32,
-                            left: cx.max(0) as u32,
-                            width: grid::CELL_W,
-                            height: layout.cell_h,
-                        },
-                        WAVEFORM_MODE_DU,
-                    )?;
-
-                    let msg = download(&mut fb, &mut renderer, &client, &hit)?;
-                    log(&msg);
-                    let rect = toast::draw_download_done(&mut fb, &mut renderer, &msg);
-                    fb.send_update(rect, WAVEFORM_MODE_GC16)?;
-                    std::thread::sleep(std::time::Duration::from_millis(900));
-
-                    view.downloaded = se::download::existing_files(Path::new(DOWNLOAD_DIR));
-                    repaint!();
+                    if idx < view.hits.len() && cx >= 0 && cy >= 0 {
+                        grid::outline_cell(&mut fb, cx, cy, layout.cell_h, true);
+                        fb.send_update(cell_rect(cx, cy, layout.cell_h), WAVEFORM_MODE_DU)?;
+                        armed = Some(Armed {
+                            slot,
+                            idx,
+                            down_at: Instant::now(),
+                            at: (x, y),
+                        });
+                    }
                 }
             }
-            InputEvent::Touch(TouchEvent::Down { .. }) => {}
             InputEvent::Touch(TouchEvent::Screenshot) => {
                 let _ = eink::screenshot::capture(&mut fb);
             }
@@ -655,6 +716,54 @@ fn run() -> anyhow::Result<()> {
                 _ => {}
             },
             InputEvent::Tick => {
+                // Either the arm deadline came up while a cover was held, or it
+                // is an ordinary idle poll and only the orientation needs a look.
+                if armed
+                    .as_ref()
+                    .is_some_and(|a| a.down_at.elapsed() >= ARM_THRESHOLD)
+                {
+                    let a = armed.take().expect("checked above");
+                    // A finger that wandered off its landing point is dragging,
+                    // not holding — cancel and clear the outline.
+                    let (px, py) = input.touch_pos();
+                    if px.abs_diff(a.at.0) > ARM_SLOP_PX || py.abs_diff(a.at.1) > ARM_SLOP_PX {
+                        log(format!(
+                            "arm cancelled: drifted to ({px},{py}) from ({},{})",
+                            a.at.0, a.at.1
+                        ));
+                        repaint!();
+                        continue;
+                    }
+                    let Some(hit) = view.hits.get(a.idx).cloned() else {
+                        repaint!();
+                        continue;
+                    };
+                    // Flip the cover to the armed cue and let it show before the
+                    // download overlay covers it, so the signal is actually seen.
+                    let (cx, cy) = layout.cell_xy(a.slot);
+                    if cx >= 0 && cy >= 0 {
+                        grid::draw_arm_cue(&mut fb, cx, cy, layout.cell_h);
+                        fb.send_update(cell_rect(cx, cy, layout.cell_h), WAVEFORM_MODE_DU)?;
+                        std::thread::sleep(ARM_DWELL);
+                    }
+                    // Fire while the finger is still down. Its eventual lift is
+                    // inert: `armed` is already taken, and a lift on the grid
+                    // does nothing.
+                    log(format!(
+                        "arm fired ({:?}) on {}",
+                        a.down_at.elapsed(),
+                        hit.title
+                    ));
+                    let msg = download(&mut fb, &mut renderer, &client, &hit)?;
+                    log(&msg);
+                    let rect = toast::draw_download_done(&mut fb, &mut renderer, &msg);
+                    fb.send_update(rect, WAVEFORM_MODE_GC16)?;
+                    std::thread::sleep(Duration::from_millis(900));
+
+                    view.downloaded = se::download::existing_files(Path::new(DOWNLOAD_DIR));
+                    repaint!();
+                    continue;
+                }
                 let o = orientation::Orientation::detect();
                 if o != orient {
                     orient = o;
