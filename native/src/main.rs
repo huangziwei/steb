@@ -50,7 +50,9 @@ const DOWNLOAD_DIR: &str = "/mnt/us/documents/standardebooks";
 /// after the azw3's ASIN, which is exactly the name the framework looks for, so
 /// the file drops in verbatim.
 const THUMBNAILS_DIR: &str = "/mnt/us/system/thumbnails";
-const LOG_PATH: &str = "/mnt/us/steb.log";
+/// Where `bin/steb.sh` funnels this process's stderr. The wrapper creates the
+/// directory before the first write, so nothing here has to.
+const LOG_PATH: &str = "/mnt/us/logs/steb.log";
 
 const FONT_PX: f32 = 32.0;
 /// Headroom above the grid for the search bar.

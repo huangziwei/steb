@@ -85,5 +85,5 @@ cat <<'EOF'
     device/documents/Steb.sh   ->  /mnt/us/documents/Steb.sh
 
 Books land in /mnt/us/documents/standardebooks/.
-Logs, if anything goes wrong, in /mnt/us/steb.log.
+Logs, if anything goes wrong, in /mnt/us/logs/steb.log.
 EOF

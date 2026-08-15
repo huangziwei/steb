@@ -3,10 +3,16 @@
 # KUAL menu entry run this, so launch logging stays in one place rather than
 # being duplicated — and a fix to either path is a fix to both.
 #
-# Captures stderr to a sibling log so a non-zero exit is never silent: on a
-# device with no shell, that log is the only account of what happened.
+# Captures stderr to a log under /mnt/us/logs so a non-zero exit is never
+# silent: on a device with no shell, that log is the only account of what
+# happened.
 EXT=/mnt/us/extensions/steb
-LOG=/mnt/us/steb.log
+LOG=/mnt/us/logs/steb.log
+
+# Nothing on a stock user partition creates this directory, and the next line
+# already appends into it — without the mkdir the launch record, and every
+# stderr line after it, would be dropped on a fresh install.
+mkdir -p "$(dirname "$LOG")"
 
 echo "[$(date)] launch $(uname -m)" >> "$LOG"
 
