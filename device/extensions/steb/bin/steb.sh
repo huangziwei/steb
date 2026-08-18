@@ -24,4 +24,11 @@ mkdir -p /mnt/us/documents/standardebooks
 # No chmod: the user partition is FAT, which has no mode bits, and exec already
 # works there.
 "$EXT/bin/steb" "$@" 2>> "$LOG"
-echo "[$(date)] exit=$?" >> "$LOG"
+# Grab the status on its own line. `$(date)` in the echo below is itself a
+# command, and in several shells it overwrites `$?` before the expansion is
+# read — logging exit=0 for every crash. busybox ash happens to keep the older
+# value, so this is a portability trap rather than a live bug on the Kindle,
+# but this log is the only account of what happened and should not depend on
+# which shell reads it.
+STATUS=$?
+echo "[$(date)] exit=$STATUS" >> "$LOG"
