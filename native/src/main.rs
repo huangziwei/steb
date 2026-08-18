@@ -19,6 +19,7 @@ mod cache;
 mod cover_cache;
 mod eink;
 mod font;
+mod net;
 mod orientation;
 mod se;
 mod ui;
@@ -180,6 +181,17 @@ fn full_rect(fb: &Framebuffer) -> MxcfbRect {
     }
 }
 
+/// Run a request, unless there is plainly no network.
+///
+/// Returns the error the request itself would have produced, so call sites
+/// report it unchanged.
+fn online<T>(attempt: impl FnOnce() -> se::http::Result<T>) -> se::http::Result<T> {
+    if net::is_offline() {
+        return Err(se::http::Error::Unreachable("Wi-Fi is off".into()));
+    }
+    attempt()
+}
+
 /// Run a network call, showing the Diagnostics screen on failure until the user
 /// either succeeds via Retry or taps Exit (`Ok(None)`).
 ///
@@ -242,7 +254,7 @@ fn fetch_next_page(
 /// whole point, since the cache means we would otherwise never need to ask.
 fn refresh_from_feed(client: &se::http::Client, catalogue: &mut cache::Catalogue) {
     let known = catalogue.feed.clone();
-    match client.text_if_modified(&Endpoint::Feed, &known) {
+    match online(|| client.text_if_modified(&Endpoint::Feed, &known)) {
         Ok(se::http::Fresh::Unchanged) => log("feed: 304, catalogue unchanged"),
         Ok(se::http::Fresh::Changed { body, validators }) => {
             let entries = se::feed::parse(&body);
@@ -350,6 +362,11 @@ fn fill_covers(
     let covers_dir = cache::covers_dir(Path::new(BUNDLE_DIR));
     let start = page * layout.page_size();
     let end = (start + layout.page_size()).min(view.hits.len());
+    // Asked once for the whole page rather than per cover: with no radio every
+    // uncached cover would spend the resolver's timeout reaching the same
+    // answer, and a page of them is a grid that takes a minute to give up.
+    // Cached covers are unaffected — they never touch the network.
+    let offline = net::is_offline();
 
     for idx in start..end {
         if view.covers.get(idx).is_some_and(|c| c.is_some()) {
@@ -360,6 +377,7 @@ fn fill_covers(
 
         let bytes = match cover_cache::load(&covers_dir, &name) {
             Some(b) => b,
+            None if offline => continue,
             None => match client.bytes(&Endpoint::Cover(href)) {
                 Ok(b) => {
                     let _ = cover_cache::store(&covers_dir, &name, &b);
@@ -416,7 +434,7 @@ fn download(
     let (rect, _) = toast::draw_download(fb, renderer, &hit.title, "Fetching…");
     fb.send_update(rect, WAVEFORM_MODE_GC16)?;
 
-    let html = match client.text(&Endpoint::Book(hit.path.clone())) {
+    let html = match online(|| client.text(&Endpoint::Book(hit.path.clone()))) {
         Ok(h) => h,
         Err(e) => return Ok(format!("Failed: {e}")),
     };
@@ -525,7 +543,7 @@ fn run() -> anyhow::Result<()> {
     // full grid of covers with no user input at all. This is the request the
     // Diagnostics screen exists for, and the only one that blocks startup.
     if with_diag(&mut fb, &mut input, &mut renderer, || {
-        fetch_next_page(&client, &mut view, &mut catalogue)
+        online(|| fetch_next_page(&client, &mut view, &mut catalogue))
     })?
     .is_none()
     {
