@@ -62,13 +62,11 @@ const TOP_MARGIN: u32 = searchbar::TOP + searchbar::HEIGHT + 16;
 /// How long a cover must be held — without drifting more than [`ARM_SLOP_PX`]
 /// from where the finger landed — before its download arms and fires.
 ///
-/// A plain tap used to download, which misfires constantly: the grid is a wall
-/// of covers with nothing else to touch, so every stray brush while reading the
-/// titles started a fetch. The armed cue paints on the cell the instant the
-/// threshold passes and the download starts with it, so the gesture is "hold
-/// until the cover flips", not "hold, then release at the right moment" — an
-/// over-long hold costs nothing and a too-short one is a visible non-event
-/// rather than a silent misclick.
+/// A tap cannot download: the grid is a wall of covers with nothing else to
+/// touch, so a stray brush while reading the titles would fetch. The armed cue
+/// paints the instant the threshold passes and the download starts with it, so
+/// the gesture is "hold until the cover flips" — an over-long hold costs
+/// nothing and a too-short one is a visible non-event.
 const ARM_THRESHOLD: Duration = Duration::from_millis(1000);
 /// Max drift (either axis, user-visible px) from the landing point that still
 /// counts as a hold rather than a drag.
@@ -585,10 +583,8 @@ fn run() -> anyhow::Result<()> {
         }};
     }
 
-    // Three gestures turn a page — the strip's Prev/Next, the bezel buttons, and
-    // a horizontal swipe — and they must agree on what a page turn *is*, down to
-    // pulling the next Standard Ebooks page before stepping into it. One
-    // definition each way, called three times.
+    // The strip, the bezel buttons and a swipe all turn pages, and must agree on
+    // what that means — including pulling the next SE page before stepping in.
     macro_rules! next_page {
         () => {{
             ensure_page!(page + 1);
@@ -607,10 +603,8 @@ fn run() -> anyhow::Result<()> {
         }};
     }
 
-    /// Repaint one cell of the current page in place — the cheap way to drop a
-    /// press outline once the press turns out not to have been one. `repaint!`
-    /// would flash the whole panel for a 360×440 change, and a cancelled press
-    /// is usually the *first* half of a swipe, so the flash would land twice.
+    /// Repaint one cell in place, to drop a press outline without `repaint!`
+    /// flashing the whole panel for a 360×440 change.
     macro_rules! redraw_cell {
         ($slot:expr) => {{
             let slot = $slot;

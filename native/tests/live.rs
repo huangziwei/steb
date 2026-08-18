@@ -47,10 +47,10 @@ fn the_opening_screen_still_parses() {
     let page = listing::parse(&html).expect("parse listing");
 
     assert!(!page.hits.is_empty(), "bare /ebooks should list books");
-    // We request per-page=48, so the catalogue is roughly 30-odd pages — not
-    // the ~125 a browser shows at its 12-per-page default. Asserting against
-    // the browser number is what first surfaced the `per-page=48` /
-    // `page=48` substring bug, so the two are kept deliberately distinct here.
+    // We request per-page=48, so the catalogue is roughly 30-odd pages, not the
+    // ~125 a browser shows at its 12-per-page default. The bounds below are set
+    // against our page size, not the browser's, so a `total_pages` that has
+    // latched onto `per-page=` instead of `page=` fails here.
     assert!(
         page.total_pages > 10,
         "expected a multi-page catalogue, got {} pages",

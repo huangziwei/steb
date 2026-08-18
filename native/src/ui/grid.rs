@@ -29,8 +29,7 @@ pub struct Label<'a> {
 /// a bigger panel wants more covers, not larger ones. Only the row/column count
 /// adapts, and height flexes just enough to land one more row.
 pub const CELL_W: u32 = 360;
-/// Tallest a cell gets — the height the 7" devices have always used, so their
-/// layout is unchanged by adaptivity.
+/// Tallest a cell gets, which is the height the 7" devices settle at.
 pub const CELL_H_MAX: u32 = 440;
 /// Shortest a cell may be squeezed to in order to fit another row. Trades ~3%
 /// of cover height for a whole extra row on a tall panel, which is the better
@@ -40,9 +39,7 @@ pub const COL_GAP: u32 = 32;
 pub const ROW_GAP: u32 = 20;
 
 /// The grid as it fits *this* panel: how many cells, how tall, and where the
-/// block sits. Computed once at startup from the framebuffer geometry and then
-/// passed around in place of the old `grid_left`/`grid_top` pair, so no call
-/// site gains a parameter.
+/// block sits. Computed once at startup from the framebuffer geometry.
 #[derive(Clone, Copy, Debug)]
 pub struct Layout {
     pub cols: usize,
@@ -58,12 +55,10 @@ impl Layout {
     /// Fit as many rows as the panel allows at [`CELL_H_MIN`], then give the
     /// rows back whatever height is spare, capped at [`CELL_H_MAX`].
     ///
-    /// Fit-then-expand rather than a plain divide, because the two orders differ
-    /// where it matters: dividing by the maximum height loses a row on the
-    /// Scribe (2210px of usable height is four 440px rows with 390px stranded),
-    /// while fitting at the minimum finds five and then settles them at 426px.
-    /// On a 1264×1680 panel both orders agree — 3×3 at the full 440 — so the
-    /// existing devices keep precisely the layout they had.
+    /// Fit-then-expand, not a plain divide: dividing by the maximum height
+    /// loses a row on the Scribe (2210px of usable height is four 440px rows
+    /// with 390px stranded), while fitting at the minimum finds five and settles
+    /// them at 426px. On a 1264×1680 panel the two agree at 3×3.
     pub fn compute(fb_xres: u32, fb_yres: u32, top_margin: u32, strip_h: u32) -> Self {
         let cols = ((fb_xres + COL_GAP) / (CELL_W + COL_GAP)).max(1) as usize;
         let avail = fb_yres.saturating_sub(top_margin + strip_h);
@@ -73,14 +68,10 @@ impl Layout {
 
         let grid_w = cols as u32 * CELL_W + (cols as u32 - 1) * COL_GAP;
 
-        // Centre the block vertically in the space between the search bar and
-        // the pager strip, rather than pinning it to `top_margin`.
-        //
-        // `cell_h` is clamped to `CELL_H_MAX`, so on a tall panel the rows do
-        // not grow to fill the region and the leftover is real: ~136px on a
-        // 1696px Colorsoft. Top-anchoring puts every pixel of it in one place —
-        // the grid crowds the search bar while a band of dead space sits above
-        // the nav. Splitting it gives breathing room at both ends.
+        // Centre the block between the search bar and the pager strip. `cell_h`
+        // is clamped to `CELL_H_MAX`, so on a tall panel the rows leave real
+        // slack — ~136px on a 1696px Colorsoft — and anchoring to the top would
+        // spend all of it below the grid.
         let content_h = rows as u32 * cell_h + (rows as u32 - 1) * ROW_GAP;
         let slack = avail.saturating_sub(content_h);
 
@@ -229,33 +220,23 @@ pub fn blit_fit(
     rect
 }
 
-/// Frame the pressed cell with a black border so the user knows which is armed
-/// (download for a book, drill-in for a series). 6px border.
+/// Frame the pressed cell with a 6px black border so the user knows which is
+/// armed (download for a book, drill-in for a series).
 ///
-/// This is the loudest thing the grid draws, and deliberately so: it is
-/// transient, it belongs to the finger that is down right now, and it must not
-/// be confused with a persistent state cue. Anything that marks a *standing*
-/// property of a book — "already in the library", say — gets the quieter
-/// [`draw_downloaded_badge`] treatment instead.
+/// Transient, and the loudest thing the grid draws. A standing property of a
+/// book gets the quieter [`draw_downloaded_badge`] instead.
 pub fn outline_cell(fb: &mut Framebuffer, cell_x: i32, cell_y: i32, cell_h: u32) {
     outline_rect(fb, cell_x, cell_y, CELL_W, cell_h, 6, 0x00);
 }
 
-/// Mark a book already in the library: a small gray check disc tucked into the
-/// cover's top-right corner.
+/// Mark a book already in the library: a small gray check disc in the cover's
+/// top-right corner.
 ///
-/// The library state is worth showing — a second download is redundant — but
-/// it is not what the grid is *for*, so it must not out-shout the books the
-/// user came here to find. Marking the cell itself inverts that: whatever
-/// carries a frame or a wash becomes the page's focal point, which is exactly
-/// backwards for the one book that needs no further attention. A corner disc
-/// costs a few hundred pixels of artwork, reads at a glance, and leaves the
-/// grid's emphasis where it belongs.
-///
-/// Top-right, not bottom: Standard Ebooks covers carry a title plate along
-/// their bottom edge, and the series tile's count badge already owns the
-/// bottom-left. `cover` is the painted cover rect from [`draw_book_cell`];
-/// a zero-size rect (off-screen cell) no-ops.
+/// Quieter than the cell itself — a mark on the whole tile would make the one
+/// book needing no attention the page's focal point. Top-right because SE
+/// covers carry a title plate along the bottom edge and the series tile's count
+/// badge owns the bottom-left. `cover` is the painted cover rect from
+/// [`draw_book_cell`]; a zero-size rect (off-screen cell) no-ops.
 pub fn draw_downloaded_badge(fb: &mut Framebuffer, cover: (i32, i32, u32, u32)) {
     let (ox, oy, w, h) = cover;
     if w == 0 || h == 0 {
@@ -319,10 +300,9 @@ fn dist_to_seg(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
 
 /// Paint the "armed" cue on a held book cell once the hold crosses the long-press
 /// threshold: a solid dark badge with a light download glyph, centered on the
-/// cover region. Drawn over the Down [`outline_cell`] (kept) so the tile reads as
-/// "held long enough — downloading now" in a single partial refresh; the cover
-/// stays visible around the badge so the user still sees which book is arming. The
-/// post-action repaint clears it. `(cell_x, cell_y)` is the on-screen cell origin
+/// cover region. Drawn over the press outline, which stays, so the tile reads as
+/// "held long enough — downloading now" in one partial refresh; the cover stays
+/// visible around the badge. The post-action repaint clears it. `(cell_x, cell_y)` is the on-screen cell origin
 /// (see [`cell_xy`]); off-screen no-ops.
 pub fn draw_arm_cue(fb: &mut Framebuffer, cell_x: i32, cell_y: i32, cell_h: u32) {
     if cell_x < 0 || cell_y < 0 {
@@ -758,14 +738,11 @@ pub fn draw_series_cell(
 mod tests {
     use super::*;
 
-    /// The 7" panels must come out of the adaptive path with exactly the layout
-    /// they had when it was three hard-coded constants — otherwise this is a
-    /// redesign of the shipped devices, not an accommodation of a new one.
+    /// The adaptive path must give the 7" panels 3×3 at the full cell height.
     ///
-    /// Both geometries are checked because they are not the same: a Colorsoft
-    /// reports 1272×1696 (measured off the device, not the 1264×1680 the older
-    /// comments assume), and a rule that only held for the rounder number would
-    /// be a rule that held for no real device.
+    /// Both geometries are checked because they differ: a Colorsoft reports
+    /// 1272×1696, not 1264×1680, and a rule holding only for the rounder number
+    /// holds for no real device.
     #[test]
     fn seven_inch_panels_are_unchanged() {
         for (w, h, expect_left) in [(1264u32, 1680u32, 60i32), (1272, 1696, 64)] {

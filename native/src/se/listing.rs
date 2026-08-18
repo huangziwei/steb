@@ -352,9 +352,8 @@ mod tests {
 
     #[test]
     fn the_bulk_of_a_browse_page_survives() {
-        // Counterweight: if a markup change broke cover extraction wholesale,
-        // every entry would look unavailable and the grid would empty out
-        // while still "working".
+        // Counterweight: cover extraction failing wholesale would mark every
+        // entry unavailable and empty the grid while still "working".
         let page = parse(BROWSE).unwrap();
         assert!(
             page.hits.len() > page.unavailable * 4,
@@ -364,7 +363,7 @@ mod tests {
         );
     }
 
-    /// The real nav shape when `per-page` is in play — the case that broke.
+    /// The nav shape when `per-page` is in play.
     const NAV_WITH_PER_PAGE: &str = r##"<html><nav class="pagination" aria-label="Pagination">
         <a aria-disabled="true">Back</a>
         <ol>

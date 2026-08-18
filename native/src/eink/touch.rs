@@ -164,8 +164,7 @@ impl Touch {
         // return, never block waiting for the rest of a touch packet.
         // Otherwise a touch fd that goes readable mid-stroke (e.g. a trailing
         // move with no following boundary) blocks the whole input loop inside
-        // the touch read, starving the bezel-button fd — the "use an on-screen
-        // control, then the physical buttons go dead until relaunch" bug.
+        // the touch read, starving the bezel-button fd.
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK)

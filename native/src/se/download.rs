@@ -1,7 +1,6 @@
 //! Fetch an azw3 and commit it to the device library.
 //!
-//! Two things here are not obvious and both were established by testing against
-//! the live site rather than reasoning about it:
+//! Two things here are not obvious:
 //!
 //! 1. The bare `.azw3` URL does **not** serve the file. It returns a ~10 KB
 //!    "Your Download Has Started!" page whose meta refresh points back at the

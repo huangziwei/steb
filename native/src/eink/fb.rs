@@ -1,11 +1,9 @@
-//! Display surface — a real WM-managed X11 window (was raw `/dev/fb0`).
+//! Display surface — a WM-managed fullscreen X11 window.
 //!
-//! Steb draws through a fullscreen X11 window instead of mmap'ing `/dev/fb0`,
-//! so the lab126 compositor *owns* the surface: it shows us fullscreen and,
-//! crucially, recomposites the whole screen (home library + status bar) when
-//! our window is torn down on exit — the kterm model. This removes the
-//! windowless-exit bug (dead status bar) and the cvm freeze that used to mask
-//! the framework drawing over us.
+//! Drawing goes through the window rather than a `/dev/fb0` mmap, so the
+//! lab126 compositor owns the surface: it shows us fullscreen and recomposites
+//! the whole screen — home library and status bar — when the window is torn
+//! down on exit. Nothing here freezes or paints over the framework.
 //!
 //! The compositor ALSO auto-rotates our window 180° to the framework
 //! orientation (page-bezel side), so we render identity here and never rotate
@@ -96,8 +94,8 @@ fn wire_channels(conn: &RustConnection, screen: &Screen, bpp: usize) -> Option<[
     ])
 }
 
-/// A rectangle to present, in screen coords. Name kept (`MxcfbRect`) so the
-/// renderer call sites are unchanged; it's no longer an MXCFB struct.
+/// A rectangle to present, in screen coords. Not an MXCFB struct, despite the
+/// name the renderer knows it by.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct MxcfbRect {
     pub top: u32,
@@ -324,11 +322,11 @@ impl Framebuffer {
 
     /// Drain the X event queue, reporting whether the server asked us to redraw.
     ///
-    /// Two distinct problems live in this queue, and nothing used to read it.
+    /// Two distinct problems live in this queue.
     ///
-    /// **Exposures.** We select `EXPOSURE` when creating the window, but with the
-    /// queue unread the damage was never repaired: the framework paints over our
-    /// window as it hands off, and nothing puts it back. We do not ask for
+    /// **Exposures.** We select `EXPOSURE` when creating the window; leaving the
+    /// queue unread leaves that damage unrepaired, and the framework paints over
+    /// our window as it hands off. We do not ask for
     /// backing store (see `open` for why that request is actively harmful here),
     /// so repairing damage is our job and this is how we learn of it.
     ///

@@ -1,12 +1,10 @@
 //! `--probe-x`: dump everything that could explain why one panel refreshes and
 //! another does not, in a form two devices can be diffed against each other.
 //!
-//! This exists because the renderer rests on an assumption that was established
-//! on one device and never checked on the others: that the X server turns damage
-//! into an eink refresh by itself, so the caller need not ask for one. If that is
-//! false anywhere, drawing is correct and the screen is still stale, and no
-//! amount of adjusting *how* we upload pixels can fix it — which is exactly the
-//! shape of a bug that resists tuning.
+//! The renderer assumes the X server turns damage into an eink refresh by
+//! itself, so the caller need not ask for one. Where that does not hold,
+//! drawing is correct and the screen is still stale, and no adjustment to *how*
+//! pixels are uploaded reaches it.
 //!
 //! So the questions here are deliberately about the mechanism, not our usage:
 //! which extensions the server offers (an eink/refresh extension being the thing
@@ -444,14 +442,11 @@ fn probe_supersession(
 
 /// Does `BackingStore::ALWAYS` stop paints from reaching the panel?
 ///
-/// Everything else in this probe has now been ruled out: the request size is
-/// irrelevant, a full-screen upload succeeds, and a burst of partial updates does
-/// not supersede a full refresh. What remains is that the probe's window and the
-/// renderer's window are not created alike — the renderer asks for backing store
-/// and the probe never did. With `Composite` active, a server that honours that
-/// request may keep our pixels in off-screen storage and propagate them to the
-/// panel on its own schedule, which looks exactly like content that is present
-/// and hit-testable but not displayed until something later flushes it.
+/// The probe's window and the renderer's are not created alike: the renderer
+/// asks for backing store. With `Composite` active, a server honouring that
+/// request may keep our pixels in off-screen storage and propagate them on its
+/// own schedule — content present and hit-testable, but not displayed until
+/// something later flushes it.
 ///
 /// Two windows, same paints, one difference. Whichever one misbehaves names the
 /// cause.

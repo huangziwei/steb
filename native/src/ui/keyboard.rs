@@ -510,10 +510,9 @@ mod tests {
 
     #[test]
     fn pressing_a_strip_slot_cannot_erase_the_chrome() {
-        // The bug: a slot's face covered its whole cell, so filling it on press
-        // painted over the top rule and over the vertical rule at its own left
-        // edge — and the restore, which draws no chrome, left them missing. The
-        // space bar showed it worst, being the widest slot.
+        // A face must not cover its whole cell: filling it on press would paint
+        // over the top rule and the vertical rule at its own left edge, and the
+        // restore draws no chrome to put them back.
         let keys = layout(XRES, YRES);
         let strip = strip_top(YRES) as i32;
         for kb in keys.iter().filter(|k| k.style == Style::Zone) {

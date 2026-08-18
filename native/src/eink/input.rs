@@ -96,9 +96,8 @@ impl Input {
         // navigation). The callers are blocking flows (download, decrypt),
         // where the touch fd carries both the Cancel button and the two-corner
         // screenshot gesture. Checking buttons first would let a stale/None
-        // button read return early and *shadow* a pending touch event —
-        // stalling the gesture until the main loop resumes (the "screenshot
-        // only works after the download" bug).
+        // button read return early and *shadow* a pending touch event,
+        // stalling the gesture until the main loop resumes.
         if fds[0].revents & libc::POLLIN != 0
             && let Some(ev) = self.touch.next_event()?
         {
