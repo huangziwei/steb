@@ -21,6 +21,6 @@ git clone https://github.com/huangziwei/steb && cd steb/
 ## Screenshot
 
 <p align="center">
-    <img src=".github/steb-home.png" height="500" />
-    <img src=".github/steb-search.png" height="500" />
+    <img src=".github/assets/steb-home.png" height="500" />
+    <img src=".github/assets/steb-search.png" height="500" />
 </p>
