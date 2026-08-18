@@ -10,8 +10,8 @@
 //! the catalogue cache — lives in the library so `cargo test` runs on a host.
 
 // The `eink/` and `ui/` modules carry a few helpers the run loop does not
-// currently call — swipe classification, some input polling. They are kept so
-// the modules stay whole and usable, and cost a few hundred bytes in a
+// currently call — some input polling, a couple of geometry accessors. They are
+// kept so the modules stay whole and usable, and cost a few hundred bytes in a
 // stripped binary.
 #![allow(dead_code)]
 
@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use eink::buttons::{Buttons, PageButton};
 use eink::fb::{Framebuffer, MxcfbRect, WAVEFORM_MODE_DU, WAVEFORM_MODE_GC16};
 use eink::input::{Input, InputEvent};
-use eink::touch::{Touch, TouchEvent};
+use eink::touch::{SwipeDir, Touch, TouchEvent, classify_swipe};
 use image::DynamicImage;
 
 use se::listing::Hit;
@@ -567,8 +567,60 @@ fn run() -> anyhow::Result<()> {
         }};
     }
 
+    // Three gestures turn a page — the strip's Prev/Next, the bezel buttons, and
+    // a horizontal swipe — and they must agree on what a page turn *is*, down to
+    // pulling the next Standard Ebooks page before stepping into it. One
+    // definition each way, called three times.
+    macro_rules! next_page {
+        () => {{
+            ensure_page!(page + 1);
+            if page + 1 < pager::n_pages(view.hits.len(), layout.page_size()) {
+                page += 1;
+                repaint!();
+            }
+        }};
+    }
+    macro_rules! prev_page {
+        () => {{
+            if page > 0 {
+                page -= 1;
+                repaint!();
+            }
+        }};
+    }
+
+    /// Repaint one cell of the current page in place — the cheap way to drop a
+    /// press outline once the press turns out not to have been one. `repaint!`
+    /// would flash the whole panel for a 360×440 change, and a cancelled press
+    /// is usually the *first* half of a swipe, so the flash would land twice.
+    macro_rules! redraw_cell {
+        ($slot:expr) => {{
+            let slot = $slot;
+            let idx = page * layout.page_size() + slot;
+            let (cx, cy) = layout.cell_xy(slot);
+            if idx < view.hits.len() && cx >= 0 && cy >= 0 {
+                let rect = grid::draw_book_cell(
+                    &mut fb,
+                    &mut renderer,
+                    cx,
+                    cy,
+                    layout.cell_h,
+                    view.covers.get(idx).and_then(|c| c.as_ref()),
+                    label_of(&view.hits[idx]),
+                );
+                if is_downloaded(&view, idx) {
+                    grid::draw_downloaded_badge(&mut fb, rect);
+                }
+                fb.send_update(cell_rect(cx, cy, layout.cell_h), WAVEFORM_MODE_DU)?;
+            }
+        }};
+    }
+
     // The cover under the finger, if any.
     let mut armed: Option<Armed> = None;
+    // Where the current stroke landed, so the matching `Up` can tell a press
+    // from a page-flip swipe. Set on every `Down`, taken on every `Up`.
+    let mut down_pos: Option<(u32, u32)> = None;
 
     loop {
         // While a cover is held, wake the loop at the arm instant so the cue can
@@ -577,6 +629,33 @@ fn run() -> anyhow::Result<()> {
         let deadline = armed.as_ref().map(|a| a.down_at + ARM_THRESHOLD);
         match input.next_deadline(deadline)? {
             InputEvent::Touch(TouchEvent::Up { x, y }) => {
+                // A horizontal swipe flips the page — the page-turn affordance a
+                // buttonless Colorsoft otherwise lacks. Checked before the press
+                // the `Down` armed, so a deliberate drag across the grid turns
+                // the page instead of scolding the user to hold longer.
+                // `take()` ends this stroke either way.
+                if let Some(dir) = down_pos
+                    .take()
+                    .and_then(|(x0, y0)| classify_swipe(x0, y0, x, y, fb.var.xres))
+                {
+                    // Cancel whatever the `Down` armed. At a page boundary the
+                    // turn is a no-op, so the press outline still has to be
+                    // cleared by hand or it stays on screen.
+                    let stale = armed.take().map(|a| a.slot);
+                    log(format!("swipe {dir:?} on page {page}"));
+                    let before = page;
+                    match dir {
+                        SwipeDir::Next => next_page!(),
+                        SwipeDir::Prev => prev_page!(),
+                    }
+                    if page == before
+                        && let Some(slot) = stale
+                    {
+                        redraw_cell!(slot);
+                    }
+                    continue;
+                }
+
                 // A hold long enough to act already fired from the `Tick` arm and
                 // cleared this, so a cover still armed here was released early.
                 if let Some(a) = armed.take() {
@@ -658,19 +737,8 @@ fn run() -> anyhow::Result<()> {
                             page = 0;
                             repaint!();
                         }
-                        pager::PagerHit::Next => {
-                            ensure_page!(page + 1);
-                            let pages = pager::n_pages(view.hits.len(), layout.page_size());
-                            if page + 1 < pages {
-                                page += 1;
-                                repaint!();
-                            }
-                        }
-                        pager::PagerHit::Prev if page > 0 => {
-                            page -= 1;
-                            repaint!();
-                        }
-                        _ => {}
+                        pager::PagerHit::Next => next_page!(),
+                        pager::PagerHit::Prev => prev_page!(),
                     }
                     continue;
                 }
@@ -679,6 +747,10 @@ fn run() -> anyhow::Result<()> {
                 // on `Down` and fired from the arm deadline in `Tick`.
             }
             InputEvent::Touch(TouchEvent::Down { x, y }) => {
+                // Every stroke's landing point, wherever it starts: the matching
+                // `Up` needs both ends to tell a press from a swipe, and a swipe
+                // may well begin in a margin or on the strip.
+                down_pos = Some((x, y));
                 // Outline the cover so the press is acknowledged immediately;
                 // whether it downloads is decided by how long the finger stays.
                 if searchbar::hit(x, y, fb.var.xres, !view.query.is_empty()).is_none()
@@ -703,19 +775,8 @@ fn run() -> anyhow::Result<()> {
                 let _ = eink::screenshot::capture(&mut fb);
             }
             InputEvent::Page(dir) => match dir {
-                PageButton::Next => {
-                    ensure_page!(page + 1);
-                    let pages = pager::n_pages(view.hits.len(), layout.page_size());
-                    if page + 1 < pages {
-                        page += 1;
-                        repaint!();
-                    }
-                }
-                PageButton::Prev if page > 0 => {
-                    page -= 1;
-                    repaint!();
-                }
-                _ => {}
+                PageButton::Next => next_page!(),
+                PageButton::Prev => prev_page!(),
             },
             InputEvent::Tick => {
                 // Either the arm deadline came up while a cover was held, or it
@@ -726,14 +787,16 @@ fn run() -> anyhow::Result<()> {
                 {
                     let a = armed.take().expect("checked above");
                     // A finger that wandered off its landing point is dragging,
-                    // not holding — cancel and clear the outline.
+                    // not holding — cancel and clear the outline. Only that cell
+                    // is repainted: the drag is very often a slow swipe, and its
+                    // `Up` is about to turn the page for real.
                     let (px, py) = input.touch_pos();
                     if px.abs_diff(a.at.0) > ARM_SLOP_PX || py.abs_diff(a.at.1) > ARM_SLOP_PX {
                         log(format!(
                             "arm cancelled: drifted to ({px},{py}) from ({},{})",
                             a.at.0, a.at.1
                         ));
-                        repaint!();
+                        redraw_cell!(a.slot);
                         continue;
                     }
                     let Some(hit) = view.hits.get(a.idx).cloned() else {
