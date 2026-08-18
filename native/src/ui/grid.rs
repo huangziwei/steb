@@ -145,6 +145,15 @@ const BADGE_MARGIN: u32 = 8;
 /// Padding inside the count badge around its number.
 const BADGE_PAD: u32 = 12;
 
+// ---- Downloaded marker (see `draw_downloaded_badge`) ----
+/// Diameter of the check disc marking a book already in the library.
+const CHECK_D: i32 = 44;
+/// Inset of that disc from the cover's top-right corner.
+const CHECK_MARGIN: i32 = 10;
+/// Shade of the disc. A step lighter than the solid-black chrome (count badge,
+/// arm cue) so the mark reads as state rather than as something to act on.
+const CHECK_SHADE: u8 = 0x55;
+
 /// Decode a JPEG/PNG byte buffer and resize to fit inside `CELL_W × CELL_H_MAX`,
 /// preserving aspect. Returns the resized image in its source color (the cover
 /// thumbnail is a color JPEG; [`blit_fit`] samples its RGB).
@@ -220,11 +229,92 @@ pub fn blit_fit(
     rect
 }
 
-/// Frame the selected cell with a black border so the user knows which is
-/// armed (download for a book, drill-in for a series). 6px border.
-pub fn outline_cell(fb: &mut Framebuffer, cell_x: i32, cell_y: i32, cell_h: u32, selected: bool) {
-    let shade = if selected { 0x00 } else { 0xFF };
-    outline_rect(fb, cell_x, cell_y, CELL_W, cell_h, 6, shade);
+/// Frame the pressed cell with a black border so the user knows which is armed
+/// (download for a book, drill-in for a series). 6px border.
+///
+/// This is the loudest thing the grid draws, and deliberately so: it is
+/// transient, it belongs to the finger that is down right now, and it must not
+/// be confused with a persistent state cue. Anything that marks a *standing*
+/// property of a book — "already in the library", say — gets the quieter
+/// [`draw_downloaded_badge`] treatment instead.
+pub fn outline_cell(fb: &mut Framebuffer, cell_x: i32, cell_y: i32, cell_h: u32) {
+    outline_rect(fb, cell_x, cell_y, CELL_W, cell_h, 6, 0x00);
+}
+
+/// Mark a book already in the library: a small gray check disc tucked into the
+/// cover's top-right corner.
+///
+/// The library state is worth showing — a second download is redundant — but
+/// it is not what the grid is *for*, so it must not out-shout the books the
+/// user came here to find. Marking the cell itself inverts that: whatever
+/// carries a frame or a wash becomes the page's focal point, which is exactly
+/// backwards for the one book that needs no further attention. A corner disc
+/// costs a few hundred pixels of artwork, reads at a glance, and leaves the
+/// grid's emphasis where it belongs.
+///
+/// Top-right, not bottom: Standard Ebooks covers carry a title plate along
+/// their bottom edge, and the series tile's count badge already owns the
+/// bottom-left. `cover` is the painted cover rect from [`draw_book_cell`];
+/// a zero-size rect (off-screen cell) no-ops.
+pub fn draw_downloaded_badge(fb: &mut Framebuffer, cover: (i32, i32, u32, u32)) {
+    let (ox, oy, w, h) = cover;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let r = CHECK_D / 2;
+    let cx = ox + w as i32 - CHECK_MARGIN - r;
+    let cy = oy + CHECK_MARGIN + r;
+    fill_disc(fb, cx, cy, r, CHECK_SHADE);
+    draw_check_glyph(fb, cx, cy, r, 0xFF);
+}
+
+/// Fill the disc of radius `r` centered at `(cx, cy)` in `shade`. Out-of-range
+/// pixels no-op in [`Framebuffer::put_pixel`], so a disc may straddle an edge.
+fn fill_disc(fb: &mut Framebuffer, cx: i32, cy: i32, r: i32, shade: u8) {
+    let rr = r * r;
+    for dy in -r..=r {
+        for dx in -r..=r {
+            if dx * dx + dy * dy <= rr {
+                fb.put_pixel(cx + dx, cy + dy, shade);
+            }
+        }
+    }
+}
+
+/// Draw a **check** glyph — the short down-stroke and the long up-stroke —
+/// centered at `(cx, cy)` and scaled to sit inside a disc of radius `r`. The
+/// two strokes are rasterized as one distance test over the glyph's box so the
+/// elbow joins cleanly instead of notching.
+fn draw_check_glyph(fb: &mut Framebuffer, cx: i32, cy: i32, r: i32, shade: u8) {
+    let (fx, fy, s) = (cx as f32, cy as f32, r as f32);
+    let half = (s * 0.15).max(1.0); // half stroke thickness
+    // Elbow low and slightly left of center, so the long arm has room to rise.
+    let elbow = (fx - s * 0.12, fy + s * 0.40);
+    let short = (fx - s * 0.58, fy - s * 0.02);
+    let long = (fx + s * 0.58, fy - s * 0.44);
+    for y in (cy - r)..=(cy + r) {
+        for x in (cx - r)..=(cx + r) {
+            let p = (x as f32 + 0.5, y as f32 + 0.5);
+            if dist_to_seg(p, elbow, short).min(dist_to_seg(p, elbow, long)) <= half {
+                fb.put_pixel(x, y, shade);
+            }
+        }
+    }
+}
+
+/// Distance from `p` to the segment `a`–`b` (float screen coords). A degenerate
+/// segment collapses to the distance from `a`.
+fn dist_to_seg(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+    let (vx, vy) = (b.0 - a.0, b.1 - a.1);
+    let (wx, wy) = (p.0 - a.0, p.1 - a.1);
+    let len2 = vx * vx + vy * vy;
+    let t = if len2 <= f32::EPSILON {
+        0.0
+    } else {
+        ((wx * vx + wy * vy) / len2).clamp(0.0, 1.0)
+    };
+    let (dx, dy) = (wx - t * vx, wy - t * vy);
+    (dx * dx + dy * dy).sqrt()
 }
 
 /// Paint the "armed" cue on a held book cell once the hold crosses the long-press
@@ -255,7 +345,7 @@ pub fn draw_arm_cue(fb: &mut Framebuffer, cell_x: i32, cell_y: i32, cell_h: u32)
 }
 
 /// Draw a `thickness`-px outline rectangle (the four edges of `w × h` at
-/// `(x, y)`) in `shade`. Used by [`outline_cell`] for the selection frame.
+/// `(x, y)`) in `shade`. Used by [`outline_cell`] for the press frame.
 /// Negative origin / zero size no-ops.
 pub fn outline_rect(
     fb: &mut Framebuffer,
@@ -574,7 +664,10 @@ fn draw_cover_tile(
 /// minus the stack bars and count badge, so books and collections line up in
 /// the grid. A missing cover falls back to a light placeholder + the title.
 /// Self-contained (clears its own cell) for both the initial paint and the
-/// per-cover refresh in `main.rs`.
+/// per-cover refresh in `main.rs`. Returns the painted cover rect, which is the
+/// letterboxed artwork rather than the cell — [`draw_downloaded_badge`] pins
+/// its corner to that, so the mark lands on the cover and not in the margin
+/// beside a narrow one.
 pub fn draw_book_cell(
     fb: &mut Framebuffer,
     renderer: &mut TextRenderer,
@@ -583,8 +676,8 @@ pub fn draw_book_cell(
     cell_h: u32,
     cover: Option<&DynamicImage>,
     title: Label,
-) {
-    draw_cover_tile(fb, renderer, cell_x, cell_y, cell_h, 0, cover, title);
+) -> (i32, i32, u32, u32) {
+    draw_cover_tile(fb, renderer, cell_x, cell_y, cell_h, 0, cover, title)
 }
 
 /// Render a series-collection tile: the shared cover tile (see

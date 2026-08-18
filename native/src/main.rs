@@ -302,7 +302,7 @@ fn draw_page(
     for idx in start..end {
         let (cx, cy) = layout.cell_xy(idx - start);
         let cover = view.covers.get(idx).and_then(|c| c.as_ref());
-        grid::draw_book_cell(
+        let rect = grid::draw_book_cell(
             fb,
             renderer,
             cx,
@@ -311,10 +311,10 @@ fn draw_page(
             cover,
             label_of(&view.hits[idx]),
         );
-        // A book already in the library gets a border, so a second tap is
-        // obviously redundant rather than silently re-downloading.
+        // A book already in the library gets a corner check, so a second tap
+        // reads as redundant rather than silently re-downloading.
         if is_downloaded(view, idx) {
-            grid::outline_cell(fb, cx, cy, layout.cell_h, true);
+            grid::draw_downloaded_badge(fb, rect);
         }
     }
 
@@ -380,7 +380,7 @@ fn fill_covers(
         view.covers[idx] = Some(img);
 
         let (cx, cy) = layout.cell_xy(idx - start);
-        grid::draw_book_cell(
+        let rect = grid::draw_book_cell(
             fb,
             renderer,
             cx,
@@ -390,7 +390,7 @@ fn fill_covers(
             label_of(&view.hits[idx]),
         );
         if is_downloaded(view, idx) {
-            grid::outline_cell(fb, cx, cy, layout.cell_h, true);
+            grid::draw_downloaded_badge(fb, rect);
         }
         fb.send_update(
             MxcfbRect {
@@ -688,7 +688,7 @@ fn run() -> anyhow::Result<()> {
                     let idx = page * layout.page_size() + slot;
                     let (cx, cy) = layout.cell_xy(slot);
                     if idx < view.hits.len() && cx >= 0 && cy >= 0 {
-                        grid::outline_cell(&mut fb, cx, cy, layout.cell_h, true);
+                        grid::outline_cell(&mut fb, cx, cy, layout.cell_h);
                         fb.send_update(cell_rect(cx, cy, layout.cell_h), WAVEFORM_MODE_DU)?;
                         armed = Some(Armed {
                             slot,
