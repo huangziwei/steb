@@ -30,28 +30,18 @@ if ! rustup target list --installed | grep -qx "$TARGET"; then
 fi
 
 # Single source of truth for the version: [workspace.package] in Cargo.toml.
-# Everything in the binary picks it up through CARGO_PKG_VERSION — the user
-# agent, the startup log line — but KUAL reads config.xml, which cargo knows
-# nothing about. Stamp it here so the two cannot drift; a hand-maintained copy
-# would sit at the old number for exactly as long as nobody looked.
+# The binary picks it up through CARGO_PKG_VERSION; this copy is only for the
+# build banner below.
 VERSION="$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0}
                 f && /^version *=/{gsub(/[" ]/,""); sub(/^version=/,""); print; exit}' \
     "$ROOT/Cargo.toml")"
 [ -n "$VERSION" ] || { echo "error: no version in [workspace.package]" >&2; exit 1; }
 
-CONFIG="$ROOT/device/extensions/steb/config.xml"
-if [ -f "$CONFIG" ]; then
-    TMP="$(mktemp)"
-    sed "s|<version>[^<]*</version>|<version>$VERSION</version>|" "$CONFIG" > "$TMP"
-    cat "$TMP" > "$CONFIG"
-    rm -f "$TMP"
-fi
-
 echo "==> building steb $VERSION for $TARGET"
 cargo build --release --target "$TARGET" -p steb-native --bin steb-native
 
 # Named `steb` on device, not `steb-native`: the tile's single-instance guard
-# is `pidof steb`, and bin/steb.sh execs that name. The cargo target keeps the
+# is `pidof steb`, and the tile runs that name. The cargo target keeps the
 # longer name so a host build cannot collide with it.
 mkdir -p "$(dirname "$OUT")"
 cp "$ROOT/target/$TARGET/release/steb-native" "$OUT"

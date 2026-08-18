@@ -50,8 +50,8 @@ const DOWNLOAD_DIR: &str = "/mnt/us/documents/standardebooks";
 /// after the azw3's ASIN, which is exactly the name the framework looks for, so
 /// the file drops in verbatim.
 const THUMBNAILS_DIR: &str = "/mnt/us/system/thumbnails";
-/// Where `bin/steb.sh` funnels this process's stderr. The wrapper creates the
-/// directory before the first write, so nothing here has to.
+/// Where the launcher funnels this process's stderr. It creates the directory
+/// before the first write, so nothing here has to.
 const LOG_PATH: &str = "/mnt/us/logs/steb.log";
 
 const FONT_PX: f32 = 32.0;
@@ -102,9 +102,9 @@ struct Armed {
     at: (u32, u32),
 }
 
-/// Write one line to stderr, which `bin/steb.sh` redirects into the log.
+/// Write one line to stderr, which the launcher redirects into the log.
 ///
-/// Deliberately *only* stderr, never [`LOG_PATH`] directly: the wrapper
+/// Deliberately *only* stderr, never [`LOG_PATH`] directly: the launcher
 /// already redirects `2>>` to that file, so writing it here too would put every
 /// line in twice.
 fn log(msg: impl AsRef<str>) {
