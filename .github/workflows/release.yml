@@ -98,6 +98,10 @@ jobs:
                   # embedded icon and have no place on the device. .DS_Store is
                   # dropped because device/ is a tree people open in Finder.
                   (cd device && zip -qr "$RUNNER_TEMP/$name.zip" extensions documents -x '*.DS_Store')
+                  # GPLv3 conveys the license with the object code, so it rides
+                  # along at the archive root rather than on the device: whoever
+                  # unzips this has it, and /mnt/us stays as it was.
+                  zip -q "$RUNNER_TEMP/$name.zip" LICENSE
                   # Written from inside $RUNNER_TEMP so the sidecar names the
                   # zip alone and `sha256sum -c` works where the two land.
                   (cd "$RUNNER_TEMP" && sha256sum "$name.zip" > "$name.zip.sha256")
