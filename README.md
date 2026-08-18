@@ -13,10 +13,14 @@ git clone https://github.com/huangziwei/steb && cd steb/
 
 ## Install
 
+Download and unzip the latest `steb-v<x.y.z>-kindle.zip` file from the [release page](https://github.com/huangziwei/steb/releases), then copy some files to your device:
+
 | from | to | notes |
 |:--|:--|:-- |
-| `device/extensions/steb/` | `/mnt/us/extensions/steb/` | or anywhere you store your extensions |
-| `device/documents/Steb.sh` | `/mnt/us/documents/Steb.sh` | or anywhere you store your scriptlets |
+| `extensions/steb/` | `/mnt/us/extensions/steb/` | or anywhere you store your extensions |
+| `documents/Steb.sh` | `/mnt/us/documents/Steb.sh` | or anywhere you store your scriptlets |
+
+A local `./build.sh` stages the same two under `device/`.
 
 ## Screenshot
 
