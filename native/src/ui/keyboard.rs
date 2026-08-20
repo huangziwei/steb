@@ -1,30 +1,6 @@
-//! On-screen keyboard — the search overlay.
-//!
-//! A plain QWERTY grid: tap letters and digits, hit `[ Search ]` to run the
-//! search or `[ Back ]` to leave without one.
-//!
-//! Latin-only is not a limitation here, it is the domain: Standard Ebooks
-//! publishes English-language books, so the ~26 letters and ten digits cover
-//! every title and author name someone would type.
-//!
-//! Layout follows a physical keyboard rather than a phone: there is a number
-//! row, so `Del` sits at its right end where a keyboard puts Backspace. The
-//! screen-level commands are not keys — they live in a bottom strip with the
-//! same geometry and grammar as [`crate::ui::filtermenu`] and
-//! [`crate::ui::pager`].
-//!
-//! Two of those commands leave the overlay and they are not the same thing.
-//! `[ Search ]` is this keyboard's Enter: it submits, and sits at the far right
-//! where a keyboard puts Enter. `[ Back ]` abandons, returning the query the
-//! overlay opened with, and takes the leftmost slot — the one the gallery gives
-//! `Exit`. Without it the only way out committed a search, so an overlay opened
-//! by accident had to be paid for with one.
-//!
-//! Same blocking-sub-loop shape as [`crate::ui::filtermenu`] / [`crate::ui::sortmenu`]:
-//! it owns input while open, full GC16 on open / page / rotate, and a single-band
-//! DU on a keystroke so typing doesn't flash the whole panel. All key labels are
-//! ASCII (`Del`/`Clear`/`space`/`[ Back ]`/`[ Search ]`) — no glyph-coverage
-//! risk, same discipline as `ui::diag`.
+//! On-screen keyboard: a QWERTY grid with `Del` at the number row's right end,
+//! `[ Search ]` far right and `[ Back ]` leftmost. A blocking sub-loop shaped
+//! like [`crate::ui::filtermenu`]; a single-band DU on a keystroke.
 
 use crate::eink::fb::{Framebuffer, MxcfbRect, WAVEFORM_MODE_DU, WAVEFORM_MODE_GC16};
 use crate::eink::input::{Input, InputEvent};
@@ -74,9 +50,8 @@ enum Style {
     Zone,
 }
 
-/// `x`/`y`/`w`/`h` is the **cell** — the whole tappable area, not the drawn
-/// face. A `Face` key draws inset by half a gap on each side, so the gutters
-/// between keys still belong to a key and a tap there registers.
+/// `x`/`y`/`w`/`h` is the **cell**, the whole tappable area. A `Face` key draws
+/// inset by half a gap, leaving the gutters inside a cell.
 struct KeyButton {
     x: i32,
     y: i32,
@@ -98,21 +73,9 @@ fn strip_top(yres: u32) -> u32 {
     yres.saturating_sub(STRIP_H)
 }
 
-/// Keyboard metrics: `(unit, unit_digits, key_h, keys_top)`.
-///
-/// Letter rows divide the span into ten columns. The digit row spans the same
-/// width but needs an eleventh cell for `Del`, so it divides that span into
-/// eleven — the two rows line up at their edges and not in between, which is
-/// what a physical keyboard's stagger does anyway.
-///
-/// Key faces are square: a row is as tall as a letter key is wide. Nothing
-/// physical or on-screen uses keys taller than they are wide, and the panel has
-/// vertical room to spare, so height follows width rather than stretching it.
-/// One row height serves every row, so the digit row's slightly narrower cells
-/// stay aligned with the letters above and below.
-///
-/// The four-row block is bottom-anchored above the command strip, so the search
-/// field stays at the top and the keys rest near the thumb.
+/// Keyboard metrics `(unit, unit_digits, key_h, keys_top)`. Letter rows divide
+/// the span into ten columns, the digit row into eleven for `Del`. Key faces
+/// are square, and the four-row block anchors above the command strip.
 fn metrics(xres: u32, yres: u32) -> (i32, i32, i32, i32) {
     let span = (xres as i32 - 2 * MARGIN).max(1);
     let unit = (span / 10).max(1);
@@ -160,11 +123,9 @@ fn layout(xres: u32, yres: u32) -> Vec<KeyButton> {
         }
     }
 
-    // Command strip. `[ Back ]` takes the leftmost slot, the one `ui/pager.rs`
-    // gives `Exit` on the gallery — leaving a screen is the same gesture
-    // wherever you are. `[ Search ]` is this keyboard's Enter, so it sits at the
-    // far right where a keyboard puts it, with the wide `space` between it and
-    // `Clear` so a mis-tap cannot wipe the query and submit in one slip.
+    // `[ Back ]` takes the leftmost slot, the one `crate::ui::pager` gives
+    // `Exit`. `[ Search ]` sits far right, the wide `space` between it and
+    // `Clear`.
     let sy = strip_top(yres) as i32;
     let side = ZONE_W.min(xres / 5);
     for (x, w, key, label) in [
@@ -205,8 +166,7 @@ fn full_rect(fb: &Framebuffer) -> MxcfbRect {
     }
 }
 
-/// The query+count band at the top — its own rect so a keystroke refreshes only
-/// this with a fast DU instead of the whole panel.
+/// The query band at the top, its own rect for a per-keystroke DU.
 fn band_rect(fb: &Framebuffer, lh: u32) -> MxcfbRect {
     MxcfbRect {
         top: 0,
@@ -216,13 +176,9 @@ fn band_rect(fb: &Framebuffer, lh: u32) -> MxcfbRect {
     }
 }
 
-/// The drawn face of a key: for a grid key the cell inset by half a gap; for a
-/// strip slot the cell inset past the strip's rules on its top and left edges.
-///
-/// That inset is what keeps a press from erasing the chrome. The rules are drawn
-/// *inside* the slot rects — the top rule along the strip's first rows, each
-/// vertical rule at a slot's own left edge — so a face covering the whole cell
-/// paints over them when it fills, and the restore leaves them gone.
+/// The drawn face of a key: a grid cell inset by half a gap, a strip slot inset
+/// past the strip's top and left rules. Those rules are drawn inside the slot
+/// rects, and a full-cell fill paints over them.
 fn face(kb: &KeyButton) -> (i32, i32, u32, u32) {
     match kb.style {
         Style::Zone => (
@@ -253,14 +209,9 @@ fn key_rect(kb: &KeyButton) -> MxcfbRect {
     }
 }
 
-/// Draw the **shared** search bar (identical to the grid view — same position,
-/// size, style) and a prompt directly below it. Caller white-fills the band
-/// first.
-///
-/// The line under the bar is a static prompt, not a live match count: there is
-/// no local corpus to count against, Standard Ebooks has no autocomplete
-/// endpoint, and counting would mean one HTTPS request per letter typed. The
-/// search runs once, on `[ Search ]`.
+/// `crate::ui::searchbar` at the grid view's own position and size, over a
+/// static prompt. The caller white-fills the band first. SE offers no
+/// autocomplete endpoint; the search runs once, on `[ Search ]`.
 fn draw_band(fb: &mut Framebuffer, renderer: &mut TextRenderer, query: &str, lh: u32) {
     let xres = fb.var.xres;
     searchbar::draw(fb, renderer, query);
@@ -282,10 +233,9 @@ fn draw_band(fb: &mut Framebuffer, renderer: &mut TextRenderer, query: &str, lh:
     );
 }
 
-/// Draw one key. `pressed` inverts it — filled black with a white label — which
-/// is the only acknowledgement a tap gets while the finger is still down: the
-/// band refresh lands later and at the far end of the screen, so without this a
-/// tap that registered looks exactly like one that missed.
+/// One key. `pressed` inverts it, filled black with a white label: the whole
+/// acknowledgement a tap gets under the finger, ahead of the band refresh at
+/// the far end of the screen.
 fn draw_key(fb: &mut Framebuffer, renderer: &mut TextRenderer, kb: &KeyButton, pressed: bool) {
     let (x, y, w, h) = face(kb);
     let (top, left) = (y.max(0) as u32, x.max(0) as u32);
@@ -328,8 +278,8 @@ fn render_all(
     draw_strip_chrome(fb, keys);
 }
 
-/// Index of the key under a touch. Cells tile their row, so a tap in a gutter
-/// lands on a neighbouring key rather than resolving to nothing.
+/// Index of the key under a touch. Cells tile their row, landing a gutter tap
+/// on a neighbouring key.
 fn hit_index(keys: &[KeyButton], tx: u32, ty: u32) -> Option<usize> {
     let (tx, ty) = (tx as i32, ty as i32);
     keys.iter()
@@ -340,10 +290,9 @@ fn hit(keys: &[KeyButton], tx: u32, ty: u32) -> Option<Key> {
     hit_index(keys, tx, ty).map(|i| keys[i].key)
 }
 
-/// Run the keyboard. Returns the typed query on `[ Search ]`, or `initial`
-/// unchanged on `[ Back ]` — the caller acts only when the two differ, so
-/// abandoning costs nothing. `initial` also pre-fills the box, so re-opening
-/// edits the current search rather than starting over.
+/// Runs the keyboard, returning the typed query on `[ Search ]` and `initial`
+/// on `[ Back ]`. The caller acts on a difference. `initial` pre-fills the box,
+/// carrying the current search into a re-open.
 pub fn run(
     fb: &mut Framebuffer,
     input: &mut Input,
@@ -376,9 +325,8 @@ pub fn run(
                     draw_key(fb, renderer, &keys[i], false);
                     fb.send_update(key_rect(&keys[i]), WAVEFORM_MODE_DU)?;
                 }
-                // The search bar stays live in the overlay — its `✕` clears,
-                // consistent with the grid view; a field tap is a no-op (already
-                // open). Otherwise resolve a key.
+                // `searchbar` is live in the overlay: its `✕` clears, a field
+                // tap no-ops. Past it, a key resolves.
                 if let Some(tap) = searchbar::hit(x, y, fb.var.xres, !query.is_empty()) {
                     if matches!(tap, searchbar::Tap::Clear) {
                         query.clear();
@@ -510,9 +458,9 @@ mod tests {
 
     #[test]
     fn pressing_a_strip_slot_cannot_erase_the_chrome() {
-        // A face must not cover its whole cell: filling it on press would paint
-        // over the top rule and the vertical rule at its own left edge, and the
-        // restore draws no chrome to put them back.
+        // A face inside its cell: a full-cell fill paints over the top rule
+        // and the vertical rule at its left edge, and the restore draws no
+        // chrome back.
         let keys = layout(XRES, YRES);
         let strip = strip_top(YRES) as i32;
         for kb in keys.iter().filter(|k| k.style == Style::Zone) {
@@ -535,9 +483,9 @@ mod tests {
 
     #[test]
     fn back_abandons_the_edit() {
-        // `Back` hands the caller the query the overlay opened with, so the
-        // caller's "did it change?" guard makes it a no-op. Guarding the wiring
-        // rather than the loop: `run` needs a framebuffer to drive.
+        // `Back` hands back the query the overlay opened with, which the
+        // caller's difference guard reads as a no-op. The wiring is under
+        // test; `run` takes a framebuffer.
         let keys = layout(XRES, YRES);
         assert!(matches!(hit(&keys, 10, YRES - 10), Some(Key::Back),));
         assert!(

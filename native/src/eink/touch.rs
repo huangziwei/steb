@@ -1,49 +1,6 @@
-//! evdev touchscreen reader.
-//!
-//! Multi-touch protocol B: the kernel emits a stream of `input_event`
-//! records with absolute X/Y plus a tracking-ID lifecycle. We surface
-//! two boundary events per contact — `Down` (finger lands) and `Up`
-//! (finger lifts) — so the long-press path can time the gap. Move
-//! events between the boundaries silently update `cur_x/cur_y`;
-//! pinch/scroll are out of scope.
-//!
-//! Per-contact wire ordering inside one `SYN_REPORT` packet:
-//!   ABS_MT_SLOT 0
-//!   ABS_MT_TRACKING_ID <id≥0>   ← contact begins (Down packet)
-//!   ABS_MT_POSITION_X / Y
-//!   SYN_REPORT
-//!   …move packets…
-//!   ABS_MT_SLOT 0
-//!   ABS_MT_TRACKING_ID -1       ← contact ends (Up packet)
-//!   SYN_REPORT
-//!
-//! We collect `down_pending` / `up_pending` flags as the events stream
-//! in and emit the boundary at `SYN_REPORT` so the position fields are
-//! correctly populated for the matching event.
-//!
-//! Device discovery: `/proc/bus/input/devices` is text. Name-matching alone is
-//! brittle across panels — KOA2 reports "cyttsp", the Colorsoft reports
-//! "fts_ts" (FocalTech) — so capability matters too: a touchscreen advertises
-//! absolute axes (`EV_ABS`) and is a direct device (`INPUT_PROP_DIRECT`).
-//! We extract its `eventN` handler; no `EVIOCGNAME` ioctl needed.
-//!
-//! Capability alone is *not* sufficient, and the Scribe is why. It carries a
-//! Wacom EMR pen digitizer alongside the finger panel, and a pen on a screen is
-//! every bit as `EV_ABS` + `INPUT_PROP_DIRECT` as a finger is. Taking the first
-//! capable node grabbed `wacomdigitizer`, and because we `EVIOCGRAB` what we
-//! open, that both blinded the picker to touch and starved the framework of pen
-//! input — the device could only be recovered by rebooting.
-//!
-//! So discovery *scores* every node and takes the best, rather than returning
-//! the first that clears a bar. Pen/stylus digitizers are excluded outright;
-//! everything else is ranked by how much it looks like a finger panel. Scoring
-//! rather than filtering is deliberate: a heuristic that ranks wrongly costs a
-//! preference, while one that filters wrongly costs the only usable device.
-//!
-//! Wire format: on the KOA2's kernel (4.1.15, 32-bit ARM), each event is
-//! 16 bytes — `struct timeval` is 8 bytes, then u16 type, u16 code,
-//! i32 value. We parse from raw bytes so the host (cargo check on macOS,
-//! where libc::c_long is 8 bytes) and the target stay byte-compatible.
+//! evdev touchscreen reader. Multi-touch protocol B: `Down` and `Up` flush at
+//! `SYN_REPORT`; a move between them updates `cur_x/cur_y`. Events are 16 raw
+//! bytes. [`pick_from_devices`] scores `/proc/bus/input/devices` nodes.
 
 use std::fs::{File, OpenOptions};
 use std::io::Read;
@@ -65,7 +22,7 @@ const ABS_MT_TRACKING_ID: u16 = 0x39;
 // Protocol-B contact selector: subsequent ABS_MT_* events address this slot.
 // Sticky — the kernel only emits it when the active contact changes.
 const ABS_MT_SLOT: u16 = 0x2f;
-// Capability bits used to identify the touchscreen in /proc/bus/input/devices.
+// Capability bits identifying a touchscreen in /proc/bus/input/devices.
 // EV_ABS in the `B: EV=` bitmap → reports absolute axes; INPUT_PROP_DIRECT in
 // `B: PROP=` → finger maps 1:1 to a screen point (touchscreen, not touchpad).
 const EV_ABS_BIT: u32 = 3;
@@ -78,11 +35,8 @@ const EVENT_BYTES: usize = 16;
 /// without demanding pixel precision.
 const SCREENSHOT_CORNER_PX: u32 = 180;
 
-/// Boundary touch events surfaced to the main loop. `Down` fires when
-/// the user's finger first lands; `Up` fires when it lifts. Move
-/// events between the two update internal `cur_x/cur_y` but don't
-/// emit — for v1 of long-press, only the timing between Down and Up
-/// matters.
+/// Boundary touch events reaching the main loop: `Down` on a landing contact,
+/// `Up` on the lift. A move between the two updates `cur_x/cur_y` silently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TouchEvent {
     Down {
@@ -93,17 +47,14 @@ pub enum TouchEvent {
         x: u32,
         y: u32,
     },
-    /// Two contacts landed simultaneously in opposite screen corners (either
-    /// diagonal) — the native Kindle screenshot gesture. We recognize it here
-    /// because the OS's own recognizer never fires under Steb: our
-    /// `EVIOCGRAB` (below) starves the framework of touch events. Carries no
-    /// coords — it's a recognized gesture, not a tap.
+    /// Two contacts in opposite screen corners, either diagonal: the Kindle
+    /// screenshot gesture, recognized here past an `EVIOCGRAB`ped framework.
+    /// Carries no coords.
     Screenshot,
 }
 
-/// Horizontal-swipe direction, classified from one touch stroke's start→end
-/// vector (see [`classify_swipe`]). The picker maps these to page turns — the
-/// page-flip affordance the buttonless Colorsoft can't get from bezel keys.
+/// Horizontal-swipe direction over one stroke's start→end vector, from
+/// [`classify_swipe`]. `main.rs` maps these to page turns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SwipeDir {
     /// Right-to-left drag → next page (the current page slides off to the left).
@@ -112,27 +63,23 @@ pub enum SwipeDir {
     Prev,
 }
 
-// _IOW('E', 0x90, int): direction(W=1)<<30 | size(4)<<16 | type('E'=0x45)<<8 | nr(0x90)
-// = 0x40000000 | 0x40000 | 0x4500 | 0x90 = 0x40044590
-// The call sites cast with `as _`: `libc::ioctl`'s request arg is `c_int` on the
-// Kindle's armv7 Linux but `c_ulong` on the desktop host, and the value fits both.
+// _IOW('E', 0x90, int) = 0x40044590. Call sites cast with `as _`:
+// `libc::ioctl`'s request arg is `c_int` on armv7 Linux and `c_ulong` on the
+// host, and the value fits both.
 const EVIOCGRAB: libc::c_int = 0x40044590;
 
 pub struct Touch {
     file: File,
     cur_x: i32,
     cur_y: i32,
-    /// Set when a new contact starts (`ABS_MT_TRACKING_ID >= 0`) and
-    /// cleared when the matching `SYN_REPORT` flushes a `Down` event.
-    /// Persists across `next_event` calls because Down/Up live in
-    /// different packets — the state machine straddles boundaries.
+    /// Set on `ABS_MT_TRACKING_ID >= 0`, cleared when the matching
+    /// `SYN_REPORT` flushes a `Down`. Down and Up live in different packets,
+    /// so this outlives one [`Touch::next_event`] call.
     down_pending: bool,
     up_pending: bool,
-    /// Multi-touch slot state for the two-corner screenshot gesture. Protocol-B
-    /// `ABS_MT_SLOT` selects which contact subsequent position/tracking events
-    /// address (sticky across packets). We track the primary (slot 0 — drives
-    /// `Down`/`Up` above, via `cur_x`/`cur_y`) plus one secondary (slot 1);
-    /// two contacts is all the gesture needs, so higher slots are ignored.
+    /// Slot state for the two-corner screenshot gesture. `ABS_MT_SLOT` is
+    /// sticky across packets: slot 0 drives `Down`/`Up`, slot 1 is the
+    /// secondary, higher slots are ignored.
     cur_slot: usize,
     slot0_active: bool,
     slot1_active: bool,
@@ -144,13 +91,12 @@ pub struct Touch {
     /// After a screenshot fires, swallow the trailing slot-0 `Up` so the lift
     /// in a corner doesn't register as a stray tap on whatever's underneath.
     suppress_next_up: bool,
-    /// Once grabbed, no other reader (framework included) sees events from
-    /// this device — which is *why* we recognize the screenshot gesture
-    /// ourselves: the framework's recognizer is starved while we hold this.
+    /// Once grabbed, no other reader sees events from this device. The stock
+    /// screenshot recognizer is starved, and [`TouchEvent::Screenshot`]
+    /// replaces it.
     grabbed: bool,
-    /// Same orientation the framebuffer was opened with. We mirror the
-    /// raw touch coords by the same amount so caller-visible coords match
-    /// what's drawn on screen.
+    /// The orientation the framebuffer was opened with. Raw touch coords
+    /// mirror by the same amount, matching what the panel draws.
     orientation: Orientation,
     fb_xres: u32,
     fb_yres: u32,
@@ -159,12 +105,9 @@ pub struct Touch {
 impl Touch {
     pub fn open(orientation: Orientation, fb_xres: u32, fb_yres: u32) -> Result<Self> {
         let path = find_touch_device()?;
-        // O_NONBLOCK is essential for the poll(2) multiplexer in `input.rs`:
-        // `next_event` must drain only the currently-available events and
-        // return, never block waiting for the rest of a touch packet.
-        // Otherwise a touch fd that goes readable mid-stroke (e.g. a trailing
-        // move with no following boundary) blocks the whole input loop inside
-        // the touch read, starving the bezel-button fd.
+        // `O_NONBLOCK` for the `poll(2)` multiplexer in `crate::eink::input`.
+        // A blocking read on an fd readable mid-stroke starves the
+        // bezel-button fd.
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK)
@@ -174,12 +117,9 @@ impl Touch {
         // boolean (see drivers/input/evdev.c). Pass 1.
         let grab_res = unsafe { libc::ioctl(file.as_raw_fd(), EVIOCGRAB as _, 1) };
         let grabbed = grab_res == 0;
-        // A failed grab is not fatal — we still read the device — but it stops
-        // being *exclusive*, so the framework goes on receiving the same touches
-        // and acts on them behind us: a swipe reaches the stock home screen, and
-        // the framework repaints over our chrome. That presents as "the picker
-        // works but the OS is fighting it", which is impossible to guess at from
-        // the outside, so say so plainly.
+        // A failed grab leaves the device readable and non-exclusive: a swipe
+        // reaches the stock home screen and the framework repaints over this
+        // window. Logged plainly.
         if grabbed {
             eprintln!("touch: EVIOCGRAB ok — exclusive");
         } else {
@@ -217,49 +157,39 @@ impl Touch {
         self.file.as_raw_fd()
     }
 
-    /// Update the orientation used to transform raw coords. The main loop calls
-    /// this when it detects the framework rotated (the X server rotates the
-    /// display, but raw evdev coords are panel-fixed), so taps keep matching
-    /// what's drawn after a 180° flip.
+    /// Sets the orientation transforming raw coords. The X server rotates the
+    /// display and raw evdev coords stay panel-fixed, so a 180° flip lands
+    /// here.
     pub fn set_orientation(&mut self, orientation: Orientation) {
         self.orientation = orientation;
     }
 
-    /// Drain currently-available events (non-blocking). Returns `Some` when a
-    /// `Down`/`Up` boundary completes — (x, y) in user-visible framebuffer
-    /// coords (orientation-corrected) — or `None` when the available data is
-    /// exhausted without completing one (a move-only or partial packet).
-    ///
-    /// **Never blocks**: the fd is opened `O_NONBLOCK`, and on `WouldBlock` we
-    /// return `None` so the `poll(2)` loop in `input.rs` re-polls and keeps
-    /// servicing the bezel-button fd. Boundary state (`down_pending`/
-    /// `up_pending`/`cur_x`/`cur_y`) lives on `self`, so a packet split across
-    /// calls resumes correctly. The caller must treat `None` as "no event yet"
-    /// and go back to `poll`, not as end-of-stream.
+    /// The available events drained. `Some` on a completed `Down`/`Up` boundary
+    /// in orientation-corrected coords, `None` on a move-only or partial
+    /// packet, which the caller re-polls. Boundary state lives on `self`.
     pub fn next_event(&mut self) -> Result<Option<TouchEvent>> {
         let mut buf = [0u8; EVENT_BYTES];
         loop {
             match self.file.read(&mut buf) {
                 Ok(EVENT_BYTES) => {}
-                // evdev hands back whole 16-byte records; 0 or a short read
-                // means nothing more is buffered right now.
+                // evdev hands back whole 16-byte records: a short read is an
+                // empty buffer.
                 Ok(_) => return Ok(None),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e).context("read /dev/input/eventN"),
             }
 
-            // Bytes 0..8 are the timestamp; we don't need it.
+            // Bytes 0..8 are the timestamp.
             let type_ = u16::from_ne_bytes([buf[8], buf[9]]);
             let code = u16::from_ne_bytes([buf[10], buf[11]]);
             let value = i32::from_ne_bytes([buf[12], buf[13], buf[14], buf[15]]);
 
             match (type_, code) {
                 (EV_SYN, SYN_REPORT) => {
-                    // Two contacts in opposite corners = the screenshot
-                    // gesture. Checked before the single-touch flush so the
-                    // gesture wins over a stray tap, and latched so it fires
-                    // once per two-finger episode (rising edge).
+                    // Two contacts in opposite corners: the screenshot
+                    // gesture, checked ahead of the single-touch flush and
+                    // latched to one firing per two-finger episode.
                     if self.slot0_active && self.slot1_active {
                         if !self.screenshot_latched {
                             let (ax, ay) = self.transform_xy(self.cur_x, self.cur_y);
@@ -278,11 +208,8 @@ impl Touch {
                         self.screenshot_latched = false;
                     }
 
-                    // Packet boundary — flush whichever pending state we
-                    // accumulated. If both fired in the same packet
-                    // (shouldn't happen — Down and Up are separate
-                    // contacts), Up wins because it's the more recent
-                    // intent.
+                    // Packet boundary, flushing the accumulated pending state.
+                    // `up_pending` wins a packet carrying both.
                     if self.up_pending {
                         self.up_pending = false;
                         self.down_pending = false;
@@ -336,11 +263,9 @@ impl Touch {
         self.transform_xy(self.cur_x, self.cur_y)
     }
 
-    /// Current primary-contact (slot 0) position in user-visible framebuffer
-    /// coords (orientation-corrected). Meaningful between a `Down` and its `Up`;
-    /// the main loop reads it at the arm deadline to reject a hold that has
-    /// drifted into a drag (the long-press slop guard). Holds the last contact
-    /// point once the finger is up.
+    /// Slot 0's position in orientation-corrected coords, live between a `Down`
+    /// and its `Up` and holding the last contact point past the lift. Read at
+    /// the arm deadline against `crate::ARM_SLOP_PX`.
     pub fn current_pos(&self) -> (u32, u32) {
         self.transform_xy(self.cur_x, self.cur_y)
     }
@@ -379,15 +304,9 @@ fn opposite_corners(ax: u32, ay: u32, bx: u32, by: u32, w: u32, h: u32) -> bool 
         || (br(ax, ay) && tl(bx, by))
 }
 
-/// Classify a touch stroke — start `(x0, y0)` to end `(x1, y1)` — as a
-/// horizontal page-flip swipe, or `None` when it's a tap, too short, or too
-/// vertical to read as an unambiguous left/right swipe.
-///
-/// Only the Down→Up endpoints are needed (the picker doesn't track the path).
-/// A swipe must travel at least `xres / 5` horizontally **and** be at least
-/// twice as horizontal as vertical (≈ within 27° of horizontal); that keeps
-/// taps (tiny `dx`) and vertical drifts from flipping pages. `xres` scales the
-/// distance floor so the threshold is resolution-independent across panels.
+/// A stroke `(x0, y0)`→`(x1, y1)` as a horizontal page-flip swipe: at least
+/// `xres / 5` of horizontal travel, twice as horizontal as vertical, within
+/// ≈27° of horizontal. A tap or a vertical drift answers `None`.
 pub fn classify_swipe(x0: u32, y0: u32, x1: u32, y1: u32, xres: u32) -> Option<SwipeDir> {
     let dx = x1 as i32 - x0 as i32;
     let dy = y1 as i32 - y0 as i32;
@@ -413,13 +332,11 @@ impl Drop for Touch {
 }
 
 /// Names that are never a finger panel. A pen digitizer satisfies every
-/// capability test a touchscreen does, so nothing but the name separates them
-/// from the outside — and grabbing one is the difference between a working
-/// picker and a device that needs a reboot.
+/// capability test a touchscreen does, leaving the name as the one separator.
 const PEN_NAMES: [&str; 4] = ["wacom", "digitizer", "stylus", "pen"];
 
-/// Names that are a finger panel on some Kindle we know of. `pt_mt` is the
-/// Scribe's (Parade multitouch), sitting next to a Wacom pen node.
+/// Finger-panel names across the fleet. `pt_mt` is the Scribe's Parade
+/// multitouch, sitting beside a Wacom pen node.
 const TOUCH_NAMES: [&str; 9] = [
     "touch",
     "cyttsp",
@@ -432,11 +349,9 @@ const TOUCH_NAMES: [&str; 9] = [
     "pt_mt",
 ];
 
-/// The firmware's own answer to which node is the finger panel. Newer Kindle
-/// firmware (the Scribe on 5.19.4.0.1) ships `/dev/input/touch` and
-/// `/dev/input/stylus` symlinks next to the `eventN` nodes. When that exists it
-/// outranks anything we could infer, because it is the device telling us
-/// directly rather than us guessing from capability bits.
+/// The firmware's own answer. Newer firmware (Scribe 5.19.4.0.1) ships
+/// `/dev/input/touch` and `/dev/input/stylus` beside the `eventN` nodes, and
+/// this alias outranks [`pick_from_devices`].
 const TOUCH_ALIAS: &str = "/dev/input/touch";
 
 fn find_touch_device() -> Result<PathBuf> {
@@ -465,10 +380,8 @@ fn pick_from_devices(raw: &str) -> Option<String> {
     let word_bits = bitmap_word_bits(raw);
 
     let mut best: Option<(i32, String, String)> = None; // (score, event node, name)
-    // A pen-named node that would otherwise qualify, kept aside. Excluding pens
-    // outright would make this a filter, and a filter that misjudges costs the
-    // only usable device — `pen` is a substring, and some panel somewhere will
-    // contain it. Held as a last resort so a wrong guess costs a preference.
+    // A qualifying pen-named node, held as a last resort: `pen` is a substring
+    // some panel name carries.
     let mut pen_fallback: Option<(String, String)> = None;
     for block in raw.split("\n\n") {
         let name = block
@@ -499,9 +412,8 @@ fn pick_from_devices(raw: &str) -> Option<String> {
             continue;
         }
 
-        // Multitouch position axes are what this parser actually reads, so a
-        // node that reports them is the one we want. Best-effort: a bitmap we
-        // can't read just doesn't earn the points.
+        // The multitouch position axes this parser reads. An unreadable
+        // bitmap earns no points.
         let has_mt = has_bitmap_bit(block, "B: ABS=", ABS_MT_POSITION_X as u32, word_bits);
 
         let score = i32::from(name_match) * 4 + i32::from(has_mt) * 2 + i32::from(is_direct);
@@ -515,7 +427,7 @@ fn pick_from_devices(raw: &str) -> Option<String> {
     }
 
     if let Some((score, node, name)) = best {
-        // stderr → steb.sh’s log; confirms which node we grabbed.
+        // stderr, which `Steb.sh` appends to its log.
         eprintln!("touch: using /dev/input/{node} (name={name:?}, score={score})");
         return Some(node);
     }
@@ -527,14 +439,9 @@ fn pick_from_devices(raw: &str) -> Option<String> {
     Some(node)
 }
 
-/// Width in bits of the kernel's `unsigned long` for the bitmaps in
-/// `/proc/bus/input/devices`, inferred from the longest hex word in the file.
-///
-/// It can't be read off a single line: the kernel prints each word with `%lx`,
-/// so leading zeros are stripped, and it omits leading all-zero words entirely.
-/// A word longer than 8 hex digits can only have come from a 64-bit long. This
-/// only ever feeds *scoring*, so guessing 32 on a device that never happens to
-/// print a wide word costs a preference, not a device.
+/// Bit width of the kernel's `unsigned long`, from the longest hex word in
+/// `/proc/bus/input/devices`. The kernel prints each word `%lx` and elides
+/// leading empty ones; a word past 8 hex digits came from a 64-bit long.
 fn bitmap_word_bits(raw: &str) -> u32 {
     let widest = raw
         .lines()
@@ -547,11 +454,9 @@ fn bitmap_word_bits(raw: &str) -> u32 {
     if widest > 8 { 64 } else { 32 }
 }
 
-/// Test one bit of a `/proc/bus/input/devices` bitmap line.
-///
-/// Words are printed most-significant first and the lowest word is always last
-/// (the kernel skips only *leading* empty words), so indexing from the end is
-/// what makes this stable regardless of how many words were elided.
+/// One bit of a `/proc/bus/input/devices` bitmap line. Words print
+/// most-significant first with the lowest last, and indexing from the end holds
+/// across any number of elided words.
 fn has_bitmap_bit(block: &str, prefix: &str, bit: u32, word_bits: u32) -> bool {
     let Some(rest) = block.lines().find_map(|l| l.strip_prefix(prefix)) else {
         return false;
@@ -566,10 +471,9 @@ fn has_bitmap_bit(block: &str, prefix: &str, bit: u32, word_bits: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// First whitespace-separated hex word of the `prefix` line in a
-/// `/proc/bus/input/devices` block (e.g. `B: EV=b` → `0xb`). `0` when the line
-/// is absent or unparseable. EV/PROP fit one word, so the most-significant-word-
-/// first ordering of multi-word bitmaps doesn't matter here.
+/// First hex word of the `prefix` line in a `/proc/bus/input/devices` block
+/// (`B: EV=b` → `0xb`), `0` on an absent or unparseable line. EV and PROP fit
+/// one word.
 fn first_hex_word(block: &str, prefix: &str) -> u64 {
     block
         .lines()
@@ -584,10 +488,8 @@ mod tests {
     use super::*;
 
     /// Verbatim `/proc/bus/input/devices` from a Kindle Scribe on 5.19.4.0.1.
-    /// The pen digitizer enumerates *before* the finger panel and is every bit
-    /// as `EV_ABS` + `INPUT_PROP_DIRECT`, which is what made the old
-    /// take-the-first-capable-node rule grab it — and, because we `EVIOCGRAB`,
-    /// left the device needing a reboot.
+    /// The pen digitizer enumerates ahead of the finger panel, as `EV_ABS` +
+    /// `INPUT_PROP_DIRECT` as it is.
     const SCRIBE_DEVICES: &str = "\
 I: Bus=0019 Vendor=0001 Product=0001 Version=0100
 N: Name=\"bd71828-pwrkey\"
@@ -643,8 +545,7 @@ B: ABS=f000003
         );
     }
 
-    /// The discriminator has to hold on capability alone, because a panel's name
-    /// is not something we can rely on knowing in advance.
+    /// The discriminator holds on capability alone: a panel name varies.
     #[test]
     fn the_pen_loses_on_capability_even_without_its_name() {
         let anonymised = SCRIBE_DEVICES
@@ -658,9 +559,9 @@ B: ABS=f000003
         );
     }
 
-    /// The Scribe's kernel is 32-bit, so `B: ABS=ee18000 0` is two 32-bit words,
-    /// most-significant first. `ABS_MT_POSITION_X` (0x35 = bit 53) lives in the
-    /// high word; the Wacom node's single word has no bit 53 at all.
+    /// The Scribe kernel is 32-bit: `B: ABS=ee18000 0` is two words,
+    /// most-significant first. `ABS_MT_POSITION_X` (0x35, bit 53) sits in the
+    /// high word, and the Wacom node's single word carries no bit 53.
     #[test]
     fn abs_mt_bit_is_read_from_the_right_word() {
         let word_bits = bitmap_word_bits(SCRIBE_DEVICES);
@@ -691,9 +592,8 @@ B: ABS=f000003
         ));
     }
 
-    /// The pen exclusion must not be able to leave a device with no input.
-    /// `pen` is a substring, so some panel will eventually contain it, and a
-    /// picker that cannot be tapped is worse than one driven by a digitizer.
+    /// The pen exclusion leaves no device without input. `pen` is a substring
+    /// some panel name carries.
     #[test]
     fn a_pen_named_node_is_used_when_it_is_the_only_candidate() {
         let only_pen = "\

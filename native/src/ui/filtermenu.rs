@@ -1,21 +1,6 @@
-//! Subject-filter overlay — a paged checklist of Standard Ebooks' subject tags.
-//!
-//! Subject is the only filter dimension, so this menu is a single flat
-//! checklist rather than a facet list drilling into value lists.
-//!
-//! Two properties worth stating, because both look like omissions:
-//!
-//! - **No counts.** Filtering happens on SE's server, and a listing page does
-//!   not say how many books carry a tag — so a number here would either be
-//!   invented or cost a request per tag.
-//! - **The vocabulary is not ours.** It arrives parsed from the listing page's
-//!   own `<select name="tags[]">`, so a subject SE adds shows up here with no
-//!   release on our side.
-//!
-//! Same blocking sub-loop shape as [`crate::ui::sortmenu`]: a pure `hit`
-//! geometry fn, a `render` that paints the panel, and a `run` that owns input
-//! until Done. Full GC16 on open, page and rotate; a single-row DU on a toggle
-//! so ticking a box doesn't flash the screen.
+//! Subject-filter overlay: a paged checklist over the `<select name="tags[]">`
+//! vocabulary, carrying no counts. A blocking sub-loop shaped like
+//! [`crate::ui::sortmenu`]; GC16 on open, page and rotate, a DU on a toggle.
 
 use crate::eink::fb::{Framebuffer, MxcfbRect, WAVEFORM_MODE_DU, WAVEFORM_MODE_GC16};
 use crate::eink::input::{Input, InputEvent};
@@ -106,7 +91,7 @@ fn n_pages(total: usize, per_page: usize) -> usize {
 }
 
 /// One row: a checkbox and the tag. ASCII marks — no glyph-coverage risk on a
-/// firmware whose font set we do not control.
+/// firmware carrying an unknown font set.
 fn row_text(filters: &Filters, tag: &str) -> String {
     let mark = if filters.is_selected(tag) {
         "[x] "
@@ -226,8 +211,7 @@ pub fn run(
                     Some(Tap::Row(slot)) => {
                         let tag = page_rows(tags, page, layout.per_page)[slot].clone();
                         filters.toggle(&tag);
-                        // Only the checkbox changed — repaint that one row with
-                        // a fast DU rather than flashing the whole panel.
+                        // One row, one DU.
                         draw_row(fb, renderer, &layout, slot, &row_text(filters, &tag));
                         let rect = layout.row_rect(slot, fb.var.xres);
                         fb.send_update(rect, WAVEFORM_MODE_DU)?;
@@ -279,10 +263,7 @@ pub fn run(
     }
 }
 
-/// Open the sort picker, then repaint this menu underneath it.
-///
-/// Kept here so the caller has one "open the menus" entry point rather than
-/// having to know the two are siblings.
+/// Opens [`sortmenu::run`], then repaints this menu underneath it.
 pub fn run_sort(
     fb: &mut Framebuffer,
     input: &mut Input,

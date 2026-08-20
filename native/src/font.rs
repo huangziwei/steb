@@ -1,41 +1,6 @@
-//! Font fallback: which face draws which character.
-//!
-//! **Steb draws Latin.** Standard Ebooks publishes English-language books, so
-//! there is no second script to reconcile and [`discover`] yields Latin faces
-//! only — a CJK face would never draw a glyph here.
-//!
-//! What remains is a fallback *chain*, which still earns its keep: an English
-//! catalogue is not pure ASCII (accented author names, classical titles,
-//! transliterated Russian), and the chain is what stops an uncovered character
-//! rendering as `.notdef`.
-//!
-//! The per-script selection machinery below is consequently vestigial — every
-//! candidate is [`Script::Unknown`], and Steb has no language tags to pass, so
-//! nothing is ever promoted and [`discover`]'s order simply stands. It is
-//! kept rather than torn out because `text.rs` and `grid.rs` are inherited
-//! intact and take a `Script` in their signatures; deleting the type would fork
-//! those modules to no benefit. It costs nothing at runtime.
-//!
-//! How a face gets picked, on its own terms:
-//!
-//! A face is chosen per string, not per character, so a run cannot end up drawn
-//! from two faces with visibly different shapes. It drops to per-character only
-//! when no single face covers the run.
-//!
-//! Coverage alone cannot decide everything, because it only ever sees what a
-//! face *lacks*. A caller that knows the language can pass it in
-//! ([`Script::of_language`]) and the chain is tried in that order; the hint only
-//! *reorders*, so coverage still decides which face actually draws and a missing
-//! or wrong tag costs shapes, never glyphs.
-//!
-//! Fallback faces are read on first miss, never at startup. A loaded face costs
-//! its file size in resident bytes, so everything after the first entry is free
-//! unless a character actually needs it — which, for this catalogue, is the
-//! expected case. (The rasterizer outlines a glyph when asked rather than the
-//! whole cmap up front, so reading the file is the entire cost.)
-//!
-//! The selection policy is a free function over a coverage oracle so it can
-//! be exercised on the host, where none of these faces exist.
+//! Font fallback over the faces the device ships. [`select`] picks one face
+//! per string, dropping to per-character where none covers the run.
+//! [`FontChain::load`] reads the first candidate and leaves the rest `Pending`.
 
 use std::path::{Path, PathBuf};
 
@@ -46,9 +11,8 @@ use anyhow::{Result, anyhow};
 /// a book asks for one through its language tag.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Script {
-    /// No preference — either the text's language is unknown or it doesn't
-    /// pick out a CJK convention. Also what a pan-Unicode face sets, so
-    /// `Unknown` deliberately promotes nothing.
+    /// No preference: an unknown language, or one naming no CJK convention.
+    /// A pan-Unicode face sets it too, and [`Script::Unknown`] promotes nothing.
     #[default]
     Unknown,
     Japanese,
@@ -63,8 +27,7 @@ impl Script {
         let mut subtags = tag.split(['-', '_']).map(str::trim);
         let primary = subtags.next().unwrap_or_default().to_ascii_lowercase();
         match primary.as_str() {
-            // `jp` is a country code rather than a language, but it is what
-            // some imported metadata carries.
+            // `jp` is a country code, carried by some imported metadata.
             "ja" | "jp" => Script::Japanese,
             // Written Cantonese is set in traditional characters — CLDR
             // resolves `yue` to `yue-Hant-HK`.
@@ -93,34 +56,22 @@ pub struct Candidate {
 
 /// Directories the firmware keeps faces in.
 ///
-/// Scanned rather than indexed: which files exist, and under what names, varies
-/// across firmware generations, and a hardcoded path that is wrong on a device
-/// fails silently — the chain simply skips it and something worse draws. A
-/// missing directory costs one failed `read_dir`.
+/// Scanned by [`discover`]. A missing directory costs one failed `read_dir`.
 const FONT_DIRS: &[&str] = &[
-    // Where the firmware keeps everything, confirmed on-device.
+    // The firmware set, confirmed on-device.
     "/usr/java/lib/fonts",
-    // Kept as insurance for a generation that moves them; absent today.
+    // Absent on this generation.
     "/usr/share/fonts",
-    // User-installed faces on a jailbroken device; last so a stray file cannot
-    // displace the system UI font.
+    // User-installed faces, last: a stray file sorts below the system UI font.
     "/mnt/us/fonts",
 ];
 
-// Deliberately *not* scanned: `/chroot/usr/java/lib/fonts` mirrors the whole
-// system set, and `/var/local/font/**` holds the CJK packs. Both would only
-// contribute duplicates and faces with nothing to draw for an English
-// catalogue.
+// Unscanned: `/chroot/usr/java/lib/fonts` mirrors the system set and
+// `/var/local/font/**` holds the CJK packs.
 
 /// Face families in preference order, matched case-insensitively against the
-/// filename.
-///
-/// **Ember leads because it is the Kindle's own UI typeface** — the one every
-/// menu and dialog on the device is set in, so Steb looks like it belongs
-/// rather than like a terminal. Bookerly (the reading face), Baskerville and
-/// Caecilia follow; `code2000` is a pan-Unicode catch-all with the widest
-/// coverage and the plainest shapes, so it sorts last and exists to guarantee
-/// the chain is never empty.
+/// filename. Ember leads, the Kindle's own UI typeface; `code2000` sorts last,
+/// a pan-Unicode catch-all keeping the chain non-empty.
 const PREFERRED: &[&str] = &[
     "ember",
     "bookerly",
@@ -130,19 +81,9 @@ const PREFERRED: &[&str] = &[
     "code2000",
 ];
 
-/// How far a cut is from the plain upright the UI wants — lower is better.
-///
-/// Checked in this order because the tokens overlap on real filenames, and the
-/// order is what makes the overlaps resolve correctly:
-///
-/// - `Amazon-Ember-RegularItalic` says *Regular* but is italic, so italics are
-///   ruled out first.
-/// - `AmazonEmberBold-Regular` is the Ember **Bold family's** regular cut — a
-///   bold face whose name contains "regular" — so weight is checked before the
-///   regular token.
-/// - `Amazon-Ember-Heavy` and `-Medium` carry no "bold"-ish token at all. They
-///   must still lose to `-Regular`, which is why an unrecognised weight word
-///   scores worse than an explicit "regular" rather than tying with it.
+/// Distance from the plain upright, lower better. The tokens overlap on real
+/// filenames: `Amazon-Ember-RegularItalic` rules out on italic first,
+/// `AmazonEmberBold-Regular` on weight, `-Heavy` and `-Medium` below "regular".
 fn weight_rank(lower: &str) -> usize {
     if lower.contains("italic") || lower.contains("oblique") {
         return 3;
@@ -172,17 +113,9 @@ fn rank(file_name: &str) -> (usize, usize) {
     (family, weight_rank(&lower))
 }
 
-/// Everything drawable this device has, best first.
-///
-/// The result feeds [`FontChain::load`], which reads the *first* entry eagerly
-/// and leaves the rest `Pending` — so entry one decides what draws every
-/// character in the UI, and the rest cost nothing unless a glyph needs them.
-///
-/// **Latin only in practice.** Standard Ebooks publishes English-language
-/// books, so there is no second script to reconcile; the chain still earns its
-/// keep because an English catalogue is not pure ASCII (accented author names,
-/// classical titles, transliterated Russian), and a fallback is what stops an
-/// uncovered character rendering as `.notdef`.
+/// Everything drawable this device has, best first, feeding
+/// [`FontChain::load`]. Latin faces in practice: an English catalogue carries
+/// accented author names and transliterated Russian past pure ASCII.
 pub fn discover() -> Vec<Candidate> {
     let mut found: Vec<(usize, usize, PathBuf)> = Vec::new();
     for dir in FONT_DIRS {
@@ -218,23 +151,19 @@ pub fn discover() -> Vec<Candidate> {
         .collect()
 }
 
-/// Which face draws a run of text. Made once per string and then consulted
-/// per character, so the metrics pass and the blit pass can never disagree
-/// about who drew what.
+/// Which face draws a run of text, decided once per string and consulted per
+/// character. The metrics pass and the blit pass read the same answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Selection {
     /// This face has every character in the run — draw it all with that one.
     Whole(usize),
-    /// No single face covers the run; resolve per character and accept the
-    /// mixed shapes, which still beats a hole in the text. Carries the run's
-    /// preference so each character is still resolved in the wanted order.
+    /// No single face covers the run: per-character resolution, carrying the
+    /// run's preference for the order.
     PerChar(Script),
 }
 
-/// Order to try faces in: the one that sets the wanted convention first, then
-/// the rest of the chain as declared.
-///
-/// `promoted` is a chain position, not an index into the discovered list — a
+/// The face setting the wanted convention first, then the chain as declared.
+/// `promoted` is a chain position, past an index into the discovered list: a
 /// firmware missing a face shortens the chain.
 pub fn visiting_order(faces: usize, promoted: Option<usize>) -> impl Iterator<Item = usize> {
     promoted
@@ -242,11 +171,9 @@ pub fn visiting_order(faces: usize, promoted: Option<usize>) -> impl Iterator<It
         .chain((0..faces).filter(move |face| Some(*face) != promoted))
 }
 
-/// First face in `order` that has every visible character of `text`.
-///
-/// `has_glyph(face, ch)` answers coverage; it is asked only until a face
-/// misses, so a face that no string needs is never consulted (and, in the
-/// renderer, never read from disk).
+/// First face in `order` carrying every visible character of `text`.
+/// `has_glyph` is asked until a face misses, leaving a face no string needs
+/// unconsulted and unread.
 pub fn covering_face<I, F>(text: &str, order: I, mut has_glyph: F) -> Option<usize>
 where
     I: IntoIterator<Item = usize>,
@@ -268,22 +195,9 @@ where
     order.into_iter().find(|&face| has_glyph(face, ch))
 }
 
-/// Code points that carry no glyph: the C0/C1 controls, plus the zero-width
-/// and formatting family — the BOM and zero-width spaces, bidi marks, the word
-/// joiner and invisible operators, and the soft hyphen.
-///
-/// They must never reach the rasterizer. No face has a glyph for them, and a
-/// font answers "no glyph" by handing back `.notdef` — so a character that is
-/// invisible everywhere else in the product turns into a visible box here.
-/// Worse, one of them in a run also costs every *other* character its face:
-/// coverage is decided per string, and a character no face has drops the whole
-/// run to per-character resolution. The zero-width family is also
-/// collation-ignorable, which is why [`crate::api`] drops it from the fields
-/// the picker sorts on.
-///
-/// A control is skipped, never interpreted. `\n` in particular is a layout
-/// instruction that whoever owns the layout has to consume first — see
-/// [`crate::ui::toast`], which lays a message out one row per line.
+/// Code points carrying no glyph: the C0/C1 controls, the BOM and zero-width
+/// spaces, bidi marks, the word joiner, invisible operators, the soft hyphen.
+/// None reaches the rasterizer, which answers a miss with a visible `.notdef`.
 pub fn is_invisible(c: char) -> bool {
     c.is_control()
         || matches!(c,
@@ -303,10 +217,8 @@ pub struct FontChain {
     rest: Vec<Face>,
 }
 
-/// A fallback slot. Candidates this firmware doesn't have are dropped when
-/// the chain loads rather than kept here, so the chain is exactly the font
-/// files the device offers, in order. The path outlives the read: it is what
-/// [`FontChain::paths`] reports.
+/// A fallback slot. [`FontChain::load`] drops the candidates this firmware
+/// lacks. `path` outlives the read, for [`FontChain::paths`].
 struct Face {
     path: PathBuf,
     script: Script,
@@ -323,13 +235,9 @@ enum State {
 }
 
 impl FontChain {
-    /// Take the `candidates` this firmware actually has and keep the first
-    /// that parses as the primary; the rest become fallbacks, unread until a
-    /// character misses.
-    ///
-    /// Fails only when none of them loads. A firmware that has moved or
-    /// dropped one face is not a reason to refuse to start — the picker draws
-    /// with whatever it finds, and only an empty chain has nothing to say.
+    /// The `candidates` this firmware carries, the first that parses as the
+    /// primary and the rest as fallbacks unread until a character misses.
+    /// Fails on an empty chain alone.
     pub fn load(candidates: &[Candidate]) -> Result<Self> {
         // Existence is settled here, parsing is not: a stat per candidate is
         // free, and it keeps `paths` an honest account of this device.
@@ -365,15 +273,13 @@ impl FontChain {
         })
     }
 
-    /// Faces in the chain, read or not. Never zero — [`FontChain::load`]
-    /// fails rather than hand back a chain that can't draw.
+    /// Faces in the chain, read or not. Never zero: [`FontChain::load`] fails
+    /// on an empty chain.
     pub fn faces(&self) -> usize {
         1 + self.rest.len()
     }
 
-    /// The chain as it stands on this device, primary first. Logged at
-    /// startup: a firmware that has moved or dropped a face otherwise shows
-    /// up only as glyphs that don't draw.
+    /// The chain on this device, primary first. Logged at startup.
     pub fn paths(&self) -> impl Iterator<Item = &Path> {
         std::iter::once(self.primary_path.as_path())
             .chain(self.rest.iter().map(|face| face.path.as_path()))
@@ -413,11 +319,9 @@ impl FontChain {
         self.ensure(face).map(|font| (face, font))
     }
 
-    /// Chain position of the face that sets `script`, if this device has it.
-    ///
-    /// [`Script::Unknown`] promotes nothing: it means "no preference", and it
-    /// is also what the pan-Unicode catch-all sets — matching on it would put
-    /// the chain's weakest face first.
+    /// Chain position of the face setting `script` on this device.
+    /// [`Script::Unknown`] promotes nothing: it names no preference, and the
+    /// pan-Unicode catch-all sets it too.
     fn promoted(&self, script: Script) -> Option<usize> {
         if script == Script::Unknown {
             return None;
@@ -489,8 +393,8 @@ mod tests {
 
     #[test]
     fn a_run_the_first_face_misses_moves_whole_to_the_next() {
-        // 楼 is in both faces, 红 only in face 1. Selection is per string, so
-        // 楼 is drawn by face 1 too rather than picking up face 0's shapes.
+        // 楼 is in both faces, 红 only in face 1. Selection is per string:
+        // face 1 draws 楼 too.
         let faces = ["楼梦", "红楼梦魇"];
         assert_eq!(
             covering_face("红楼梦魇", unhinted(&faces), repertoires(&faces)),
@@ -536,11 +440,9 @@ mod tests {
 
     #[test]
     fn control_characters_never_reach_the_rasterizer() {
-        // A banner message joins its clauses with `\n`. No face has U+000A, so
-        // a newline that got this far both drew the missing-glyph box and, by
-        // missing everywhere, dropped the rest of the line to per-character
-        // resolution. The layout consumes it; the renderer skips whatever is
-        // left, here and for any other control that rides in on metadata.
+        // A banner message joins its clauses with `\n`, and no face carries
+        // U+000A. The layout consumes it; the renderer skips what is left,
+        // here and for any control riding in on metadata.
         for c in ['\n', '\r', '\t', '\u{0}', '\u{7F}', '\u{85}'] {
             assert!(is_invisible(c), "{c:?} would draw as a box");
         }
@@ -572,9 +474,8 @@ mod tests {
 
     #[test]
     fn a_hint_wins_over_a_face_that_would_also_have_covered_the_run() {
-        // The whole point of the hint: face 0 (Japanese) has every character
-        // of this Traditional title, so coverage alone would leave it there
-        // in Japanese shapes. The Traditional face is face 2.
+        // Face 0 (Japanese) covers every character of this Traditional title.
+        // Face 2 is the Traditional one.
         let faces = ["粵語語法講義", "粤语语法讲义", "粵語語法講義"];
         assert_eq!(
             covering_face("粵語語法講義", visiting_order(3, None), repertoires(&faces)),
@@ -621,9 +522,8 @@ mod tests {
 
     #[test]
     fn the_ui_font_wins_on_a_real_device() {
-        // Every Latin face on a Colorsoft (firmware 5.18), verbatim. Ranking
-        // against invented filenames is what made the first cut wrong: three
-        // of these carry no "bold"-ish token yet must still lose to Regular.
+        // Every Latin face on a Colorsoft (firmware 5.18), verbatim. Three
+        // carry no bold-ish token and rank below Regular.
         let mut faces = [
             "Amazon-Ember-Bold.ttf",
             "Amazon-Ember-BoldItalic.ttf",
@@ -665,10 +565,8 @@ mod tests {
                 "{trap} should rank below the plain regular"
             );
         }
-        // The pan-Unicode catch-all is the last resort among faces we name —
-        // below every preferred family, but still above the ones we do not
-        // name at all (Blackbox, Futura, the Noto script packs), because its
-        // coverage is the widest thing we can fall back to.
+        // The pan-Unicode catch-all ranks below every [`PREFERRED`] family and
+        // above the unnamed ones (Blackbox, Futura, the Noto script packs).
         for named in ["Bookerly-Regular.ttf", "Baskerville-Regular.ttf"] {
             assert!(rank(named) < rank("code2000.ttf"));
         }
@@ -677,10 +575,8 @@ mod tests {
 
     #[test]
     fn language_classification_still_works_even_though_nothing_uses_it() {
-        // `Script::of_language` is pure and inherited intact. Steb never calls
-        // it — it has no language tags to pass — but the machinery reading
-        // `Script` is shared with `text.rs`/`grid.rs`, so leaving it correct
-        // costs nothing and keeps those modules unforked.
+        // `Script::of_language` is pure and uncalled: Steb passes no language
+        // tags. `text.rs` and `grid.rs` take a `Script` in their signatures.
         assert_eq!(Script::of_language("en"), Script::Unknown);
         assert_eq!(Script::of_language(""), Script::Unknown);
     }

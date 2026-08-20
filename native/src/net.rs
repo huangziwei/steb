@@ -1,30 +1,20 @@
-//! Is there a route off this device?
-//!
-//! Standard Ebooks is reached by name, so with no route the resolver runs
-//! first and waits out its own timeout before the request fails. Reading
-//! `/proc/net/route` answers in a file read instead.
-//!
-//! Says offline only when certain. A table it cannot read is not an answer,
-//! and the caller should make the request anyway.
+//! `/proc/net/route`, read for a default route off this device.
 
 use std::fs;
 
 /// The kernel's IPv4 routing table.
 const ROUTE_TABLE: &str = "/proc/net/route";
 
-/// `RTF_UP` — the flag that separates a live route from a listed one.
+/// `RTF_UP`, in the Flags column.
 const RTF_UP: u32 = 0x0001;
 
-/// Is there no route off this device? False if the table cannot be read.
+/// No default route in [`ROUTE_TABLE`]. False where the read fails.
 pub fn is_offline() -> bool {
     fs::read_to_string(ROUTE_TABLE).is_ok_and(|table| !has_default_route(&table))
 }
 
-/// Does this table carry a usable default route?
-///
-/// Whitespace-separated columns — `Iface Destination Gateway Flags …` — after
-/// one header line. Destination `00000000` is the default route; `RTF_UP` is
-/// what makes it usable rather than merely listed.
+/// A `00000000` destination carrying [`RTF_UP`], in the whitespace-separated
+/// columns `Iface Destination Gateway Flags …` after one header line.
 fn has_default_route(table: &str) -> bool {
     table.lines().skip(1).any(|line| {
         let mut cols = line.split_whitespace().skip(1); // past Iface
@@ -42,13 +32,13 @@ fn has_default_route(table: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// Wi-Fi up: a default route through the gateway, plus the on-link subnet.
+    /// A default route through the gateway, plus the on-link subnet.
     const CONNECTED: &str = "\
 Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT
 wlan0\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0
 wlan0\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0";
 
-    /// Associated, no lease: the subnet is on-link, nothing leaves it.
+    /// The on-link subnet alone.
     const NO_DEFAULT: &str = "\
 Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT
 wlan0\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0";

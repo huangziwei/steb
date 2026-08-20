@@ -1,29 +1,13 @@
-//! Every URL Steb is allowed to fetch, as a closed set of types.
-//!
-//! Standard Ebooks pages carry a honeypot link — labelled "Following this link
-//! will ban your IP for 24 hours" — and `/honeypot` is the one path their
-//! robots.txt disallows for every user agent. A client that follows hrefs it
-//! finds in markup will eventually follow that one and get the device's IP
-//! banned.
-//!
-//! So the rule is: **never follow a discovered href; only build a URL from a
-//! known shape.** That rule is enforced here rather than written in a comment
-//! somewhere, by giving [`Endpoint`] no general constructor. There is no
-//! `Endpoint::parse(&str)` and no way to hand [`crate::se::http`] a bare
-//! string. The hrefs we *do* take from markup — the `.azw3` download and the
-//! cover image — go through [`DownloadHref::parse`] / [`CoverHref::parse`],
-//! which validate the shape and reject anything else, so a markup change that
-//! swapped one for a link to `/honeypot` yields an error instead of a ban.
+//! Every URL Steb fetches, as a closed set of types. [`Endpoint`] carries no
+//! general constructor; the two hrefs read from markup go through
+//! [`DownloadHref::parse`] and [`CoverHref::parse`].
 
 use std::fmt;
 
-/// Scheme + host, prepended to every path we build. HTTPS only: the site sends
-/// HSTS and there is nothing to gain from allowing a downgrade.
+/// Scheme and host, prepended to every path built here. HTTPS only.
 pub const ORIGIN: &str = "https://standardebooks.org";
 
-/// A rejected URL shape. Carries the offending value so the caller can log what
-/// the markup actually contained — a parse failure here means SE changed their
-/// HTML, and the failing string is the whole diagnosis.
+/// A rejected URL shape, carrying the offending value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BadUrl(pub String);
 
@@ -39,10 +23,7 @@ impl fmt::Display for BadUrl {
 
 impl std::error::Error for BadUrl {}
 
-/// Characters allowed in a path segment we build a URL from. SE slugs are
-/// lowercase ASCII words joined by hyphens, with digits in a few titles.
-/// Deliberately strict: anything outside this set (a `.`, a `/`, a `%`, a
-/// space) means we are not looking at a slug and should not be building a URL.
+/// Characters legal in a path segment: lowercase ASCII, digits, hyphen.
 fn is_slug(seg: &str) -> bool {
     !seg.is_empty()
         && seg
@@ -50,28 +31,19 @@ fn is_slug(seg: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// One or more slugs joined by `_`.
-///
-/// A book credited to two translators puts both in one path segment —
-/// `/ebooks/leo-tolstoy/war-and-peace/louise-maude_aylmer-maude` — and the same
-/// joiner appears in cover slugs (`author_title`) and download filenames. So
-/// `_` is a separator *within* a segment, never a character inside a slug.
+/// One or more slugs joined by `_`, as in
+/// `/ebooks/leo-tolstoy/war-and-peace/louise-maude_aylmer-maude`.
 fn is_slug_group(seg: &str) -> bool {
     !seg.is_empty() && seg.split('_').all(is_slug)
 }
 
-/// A book's page path: `/ebooks/{author}/{title}` with an optional third
-/// segment for a translator or editor (`/ebooks/aristophanes/the-birds/the-athenian-society`).
-///
-/// Stored without the leading `/ebooks/` prefix so it round-trips as the
-/// catalogue cache key — see [`crate::cache`].
+/// `/ebooks/{author}/{title}`, with an optional third segment for a translator
+/// or editor. Stored without the `/ebooks/` prefix, as [`crate::cache`] keys it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BookPath(String);
 
 impl BookPath {
-    /// Parse the `about=` / feed `<id>` form. Accepts a bare path
-    /// (`/ebooks/bram-stoker/dracula`) or a full URL on our own origin, since
-    /// the listing markup uses the first and the Atom feed the second.
+    /// A bare path (`/ebooks/bram-stoker/dracula`) or a full URL on [`ORIGIN`].
     pub fn parse(raw: &str) -> Result<Self, BadUrl> {
         let path = raw.strip_prefix(ORIGIN).unwrap_or(raw);
         let rest = path
@@ -86,7 +58,7 @@ impl BookPath {
         Ok(Self(rest.to_string()))
     }
 
-    /// `bram-stoker/dracula` — the cache key and the stable identity of a book.
+    /// `bram-stoker/dracula`, the [`crate::cache`] key.
     pub fn as_key(&self) -> &str {
         &self.0
     }
@@ -97,12 +69,8 @@ impl BookPath {
     }
 }
 
-/// A `.azw3` download href lifted from a book page's `class="amazon"` link.
-///
-/// Never constructed by hand. The filename slug gains segments for translators
-/// (`homer_the-iliad_alexander-pope.azw3`), so guessing `{author}_{title}.azw3`
-/// 404s across a large minority of the catalogue — the href must come from the
-/// page. This type is what makes taking it from markup safe.
+/// A `.azw3` href from a book page's `class="amazon"` link. The slug carries
+/// translator segments (`homer_the-iliad_alexander-pope.azw3`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadHref(String);
 
@@ -126,18 +94,14 @@ impl DownloadHref {
         Ok(Self(path.to_string()))
     }
 
-    /// The filename SE serves it under — also what we write into
-    /// `documents/standardebooks/`, so a re-download is detectable by name.
+    /// The filename, as `se::download::commit` writes it.
     pub fn file_name(&self) -> &str {
         self.0.rsplit('/').next().unwrap_or_default()
     }
 }
 
-/// A cover image href from listing markup: `/images/covers/{slug}/{sha}/cover@2x.jpg`.
-///
-/// The `sha` makes these content-addressed, which is why the cover cache never
-/// needs invalidating — a re-produced cover arrives under a new URL and the old
-/// file is simply orphaned.
+/// A cover href: `/images/covers/{slug}/{sha}/cover@2x.jpg`. The `sha` makes
+/// these content-addressed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoverHref {
     path: String,
@@ -172,8 +136,7 @@ impl CoverHref {
         })
     }
 
-    /// Cache filename: `<slug>.<sha>.jpg` — one file per book, with prior
-    /// shas pruned on store.
+    /// Cache filename `<slug>.<sha>.jpg`, one file per book.
     pub fn cache_name(&self) -> String {
         format!("{}.{}.jpg", self.slug, self.sha)
     }
@@ -182,27 +145,14 @@ impl CoverHref {
         &self.slug
     }
 
-    /// The URL path, as persisted in the catalogue cache. Stored as a plain
-    /// string and re-parsed on load, so a markup change that produced an
-    /// unparseable cover can never make the whole cache unreadable.
+    /// The URL path, persisted as a plain string and re-parsed on load.
     pub fn as_path(&self) -> &str {
         &self.path
     }
 }
 
-/// The Kindle cover thumbnail a book page links:
-/// `/ebooks/{…}/downloads/thumbnail_<id>_EBOK_portrait.jpg`.
-///
-/// `<id>` is exactly the ASIN embedded in the azw3, which is what makes this
-/// worth fetching: dropping the file into `/mnt/us/system/thumbnails/` under
-/// its own given name is precisely what the framework looks for, so a
-/// sideloaded book gets a real cover on the home screen instead of the grey
-/// placeholder. Nothing has to parse the book to find the ASIN — Standard
-/// Ebooks has already named the file after it.
-///
-/// Distinct from [`CoverHref`] despite both being JPEGs: this lives under
-/// `/ebooks/…/downloads/`, not `/images/covers/`, so it fails that type's shape
-/// check and needs its own.
+/// `/ebooks/{…}/downloads/thumbnail_<id>_EBOK_portrait.jpg`, `<id>` the ASIN
+/// embedded in the azw3. A path [`CoverHref`] rejects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThumbnailHref {
     path: String,
@@ -227,15 +177,13 @@ impl ThumbnailHref {
         })
     }
 
-    /// The name to write into `/mnt/us/system/thumbnails/`. Used verbatim —
-    /// Standard Ebooks' filename is already the one the framework expects.
+    /// The name to write into `/mnt/us/system/thumbnails/`, used verbatim.
     pub fn file_name(&self) -> &str {
         &self.file
     }
 }
 
-/// Which sort the user picked. `None` anywhere this appears means "SE's own
-/// default", which we express by omitting the parameter entirely.
+/// The chosen sort. `None` omits the parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sort {
     Relevance,
@@ -247,18 +195,7 @@ pub enum Sort {
 }
 
 impl Sort {
-    /// SE uses **different values for the same sort** depending on whether a
-    /// query is present, and offers `relevance` only when one is:
-    ///
-    /// | sort                  | browse    | search      |
-    /// |-----------------------|-----------|-------------|
-    /// | release date new→old  | `default` | `newest`    |
-    /// | relevance             | *absent*  | `relevance` |
-    ///
-    /// So the value cannot be baked into the enum; it is resolved here, at
-    /// URL-build time, from whether the listing has a query. Returning `None`
-    /// drops the parameter — which is what `Relevance` does while browsing,
-    /// since there is nothing to be relevant to.
+    /// The `sort=` value for `has_query`. `None` drops the parameter.
     fn as_param(self, has_query: bool) -> Option<&'static str> {
         Some(match self {
             Sort::Relevance => {
@@ -282,13 +219,10 @@ impl Sort {
     }
 }
 
-/// How many results per listing request. SE allows only these three; 48 keeps
-/// one handshake filling roughly five device grid pages.
+/// Results per listing request. One of three values SE accepts.
 pub const PER_PAGE: u16 = 48;
 
-/// What a listing request asks for. Browsing is this with `query: None` — SE
-/// serves both from the same endpoint with identical markup, which is why Steb
-/// has one parser and one grid rather than separate browse and search modes.
+/// One listing request. `query: None` browses.
 #[derive(Debug, Clone, Default)]
 pub struct Listing {
     pub query: Option<String>,
@@ -297,9 +231,8 @@ pub struct Listing {
     pub tags: Vec<String>,
 }
 
-/// Percent-encode for a query-string value. Hand-rolled because the only
-/// alternative is pulling a URL crate in for one function; the unreserved set
-/// is from RFC 3986 and space becomes `+` as the form encoding expects.
+/// Percent-encode a query-string value: the RFC 3986 unreserved set, space
+/// as `+`.
 fn encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for b in value.bytes() {
@@ -314,23 +247,20 @@ fn encode(value: &str) -> String {
     out
 }
 
-/// The closed set of fetchable URLs. No general constructor — see the module
-/// docs for why that is the point rather than an oversight.
+/// The closed set of fetchable URLs. No general constructor.
 #[derive(Debug, Clone)]
 pub enum Endpoint {
-    /// `/ebooks` with or without a query — browse and search are one endpoint.
+    /// `/ebooks`, with or without a query.
     Listing(Listing),
-    /// A book's own page, fetched to read its `.azw3` href.
+    /// A book's own page, carrying its `.azw3` href.
     Book(BookPath),
-    /// The `.azw3` itself, with `?source=download` so SE serves the file
-    /// instead of the "Your Download Has Started!" interstitial.
+    /// The `.azw3` itself, under `?source=download`.
     Download(DownloadHref),
     /// A cover image for the grid.
     Cover(CoverHref),
     /// The Kindle home-screen thumbnail for a downloaded book.
     Thumbnail(ThumbnailHref),
-    /// The public new-releases Atom feed — the only feed not gated behind the
-    /// Patrons Circle, and our delta channel for catalogue updates.
+    /// The public new-releases Atom feed.
     Feed,
 }
 
@@ -348,10 +278,7 @@ impl Endpoint {
                 for tag in &l.tags {
                     q.push(format!("tags%5B%5D={}", encode(tag)));
                 }
-                // Omitted unless the user actively chose a sort, so SE applies
-                // its own default: release date new→old browsing, relevance
-                // searching. Right in both modes, and it sidesteps the
-                // vocabulary split above for the common case.
+                // Omitted for a [`SortState`] default, leaving SE's own.
                 let has_query = l.query.as_deref().is_some_and(|t| !t.is_empty());
                 if let Some(s) = l.sort.and_then(|s| s.as_param(has_query)) {
                     q.push(format!("sort={s}"));
@@ -360,9 +287,7 @@ impl Endpoint {
                 format!("{ORIGIN}/ebooks?{}", q.join("&"))
             }
             Endpoint::Book(p) => format!("{ORIGIN}{}", p.as_path()),
-            // The bare href returns a ~10 KB interstitial whose meta refresh
-            // points back at this same URL with `?source=download`. Asking for
-            // it directly skips a request and a parse.
+            // `?source=download` in place of the interstitial the bare href serves.
             Endpoint::Download(d) => format!("{ORIGIN}{}?source=download", d.0),
             Endpoint::Cover(c) => format!("{ORIGIN}{}", c.path),
             Endpoint::Thumbnail(t) => format!("{ORIGIN}{}", t.path),
@@ -383,7 +308,7 @@ mod tests {
                 .as_key(),
             "bram-stoker/dracula"
         );
-        // Translator third segment — the feed's <id> form, full URL.
+        // The feed's <id> form: a full URL, translator third segment.
         assert_eq!(
             BookPath::parse(
                 "https://standardebooks.org/ebooks/aristophanes/the-birds/the-athenian-society"
@@ -396,9 +321,7 @@ mod tests {
 
     #[test]
     fn book_path_accepts_two_translators_in_one_segment() {
-        // A book credited to two translators joins them with `_` inside the
-        // third segment. A hyphens-only slug rule rejects every such book, and
-        // there are many.
+        // Two translators join with `_` inside the third segment.
         assert_eq!(
             BookPath::parse("/ebooks/leo-tolstoy/war-and-peace/louise-maude_aylmer-maude")
                 .unwrap()
@@ -409,7 +332,7 @@ mod tests {
 
     #[test]
     fn book_path_rejects_anything_that_is_not_a_book() {
-        // The honeypot is the whole reason this type exists.
+        // `/honeypot`, the path robots.txt disallows.
         assert!(BookPath::parse("/honeypot").is_err());
         assert!(BookPath::parse("https://example.com/ebooks/a/b").is_err());
         assert!(BookPath::parse("/ebooks/bram-stoker").is_err());
@@ -432,7 +355,7 @@ mod tests {
 
     #[test]
     fn download_href_accepts_translator_segments() {
-        // Guessing {author}_{title}.azw3 would miss these entirely.
+        // A translator segment in the filename slug.
         assert!(
             DownloadHref::parse(
                 "/ebooks/homer/the-iliad/alexander-pope/downloads/homer_the-iliad_alexander-pope.azw3"
@@ -477,7 +400,7 @@ mod tests {
 
     #[test]
     fn sort_value_depends_on_whether_a_query_is_present() {
-        // The trap: same human-facing sort, two different parameter values.
+        // One sort, two parameter values.
         let browse = Endpoint::Listing(Listing {
             sort: Some(Sort::Newest),
             ..Default::default()
@@ -496,7 +419,7 @@ mod tests {
 
     #[test]
     fn relevance_is_dropped_when_browsing() {
-        // SE does not offer it without a query, so sending it would be a lie.
+        // `relevance` is a search-only value.
         let browse = Endpoint::Listing(Listing {
             sort: Some(Sort::Relevance),
             ..Default::default()

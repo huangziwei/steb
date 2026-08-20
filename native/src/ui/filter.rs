@@ -1,28 +1,19 @@
-//! Which subject tags the user has selected.
-//!
-//! Standard Ebooks filters by subject tag, server-side, and the vocabulary
-//! comes from the listing page itself rather than from anything computed here.
-//!
-//! That is why there is no `matches()` predicate. Nothing is filtered on
-//! device: selections become `tags[]` parameters and SE returns the narrowed
-//! listing.
+//! The selected subject tags. SE filters server-side, so a selection reaches
+//! it as `tags[]` parameters and no predicate lives here.
 
 use std::collections::BTreeSet;
 
-/// SE's "all tags" sentinel. Present as an `<option>` in the page's tag select,
-/// but it means "no filter", so it is never sent and never stored.
+/// SE's "all tags" `<option>`, meaning no filter. Never sent, never stored.
 pub const ALL: &str = "all";
 
-/// The user's current selection. Empty means unfiltered, which is the state the
-/// app opens in.
+/// The current selection. Empty is unfiltered, the state the app opens in.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Filters {
     tags: BTreeSet<String>,
 }
 
 impl Filters {
-    /// How many tags are active — the count the pager strip shows on its Filter
-    /// slot so the user can see a filter is on without opening the menu.
+    /// Active tags, as the `pager` strip shows on its Filter slot.
     pub fn count(&self) -> usize {
         self.tags.len()
     }
@@ -35,8 +26,7 @@ impl Filters {
         self.tags.contains(tag)
     }
 
-    /// Toggle one tag. Selecting SE's `all` sentinel clears instead, which is
-    /// what it means on the site.
+    /// Toggles one tag. [`ALL`] clears the selection.
     pub fn toggle(&mut self, tag: &str) {
         if tag == ALL {
             self.clear();
@@ -51,8 +41,7 @@ impl Filters {
         self.tags.clear();
     }
 
-    /// The values to put in the URL, in a stable order so two identical
-    /// selections always build the same URL.
+    /// The URL values, in a stable order.
     pub fn as_params(&self) -> Vec<String> {
         self.tags.iter().cloned().collect()
     }

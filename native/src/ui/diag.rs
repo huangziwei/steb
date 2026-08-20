@@ -1,19 +1,6 @@
-//! Boot-failure Diagnostics screen.
-//!
-//! When the first request to standardebooks.org fails at launch, Steb renders
-//! this panel instead of flashing a toast and dropping back to the home screen.
-//! It shows the actual error and a class-specific hint, and offers two tap
-//! zones — **Retry** and **Exit** — so the user has an on-device recourse
-//! (turn Wi-Fi on, then Retry) without relaunching.
-//!
-//! This is why `main.rs` opens the X window, framebuffer, touch and renderer
-//! *before* the first network call: this screen needs a surface to draw on and
-//! `input` to take taps.
-//!
-//! Modeled on `ui/pager.rs` (a bottom button strip + a pure `hit` geometry fn)
-//! and `ui/toast.rs` (a centered panel). Page-button events are ignored here —
-//! there's no paging — but because `Input` has grabbed the bezel device, a
-//! press still can't leak to the framework and repaint over us.
+//! Boot-failure Diagnostics screen: the error, a class-specific hint, and
+//! **Retry** / **Exit** tap zones. `main.rs` opens the X window, framebuffer,
+//! touch and renderer ahead of the first network call, for this screen.
 
 use crate::eink::fb::{Framebuffer, MxcfbRect, WAVEFORM_MODE_GC16};
 use crate::eink::input::{Input, InputEvent};
@@ -21,31 +8,26 @@ use crate::eink::touch::TouchEvent;
 use crate::se::http::Error as HttpError;
 use crate::ui::text::TextRenderer;
 
-/// What the user chose on the Diagnostics screen.
+/// What a tap on the Diagnostics screen resolved to.
 pub enum Action {
-    /// Re-run `list_books` — the server may now be reachable.
+    /// Re-run the request.
     Retry,
     /// Leave the picker, back to the home screen.
     Exit,
 }
 
-/// Bottom button row height. Taller than `pager`'s 80px strip — it holds
-/// only two zones (no page nav), and a boot-failure screen wants a
-/// generous, hard-to-miss target.
+/// Bottom button row height, over `pager`'s 80px strip: two wide zones.
 const BTN_H: u32 = 120;
-/// Left inset for the info block, and the per-side margin used to bound
-/// the wrapped Last/Hint rows.
+/// Left inset for the info block, bounding the wrapped Last and Hint rows.
 const MARGIN_X: u32 = 60;
 
 fn btn_top(yres: u32) -> u32 {
     yres.saturating_sub(BTN_H)
 }
 
-/// Map a tap to a button. Anything above the button row is dead space
-/// (no action); the row splits left = Exit, right = Retry — the leave action
-/// sits leftmost, matching the gallery's Exit and the filter screens. Pure
-/// integer geometry so it can be reasoned about without a framebuffer (mirrors
-/// `pager::hit`).
+/// A tap mapped to a button. Above the button row is dead space; the row
+/// splits left `Exit`, right `Retry`, matching `pager`'s leftmost `Exit`. Pure
+/// integer geometry, like `pager::hit`.
 pub fn hit(tx: u32, ty: u32, xres: u32, yres: u32) -> Option<Action> {
     if ty < btn_top(yres) {
         return None;
@@ -57,13 +39,8 @@ pub fn hit(tx: u32, ty: u32, xres: u32, yres: u32) -> Option<Action> {
     }
 }
 
-/// The `Last` (what failed) and `Hint` (what to do) rows for an error.
-///
-/// There is exactly one server and no credential, so there are no connection
-/// settings worth printing — only the error and what the user can do about it.
-/// The hint comes from
-/// [`crate::se::http::Error::hint`], which is written for someone holding an
-/// e-reader rather than reading a terminal.
+/// The `Last` and `Hint` rows for `err`, the hint from
+/// [`crate::se::http::Error::hint`].
 fn rows_for(err: &HttpError) -> (String, String) {
     (format!("{err}"), err.hint().to_string())
 }
@@ -133,11 +110,9 @@ fn draw(fb: &mut Framebuffer, renderer: &mut TextRenderer, err: &HttpError) -> a
     Ok(())
 }
 
-/// Two-zone button row at the bottom: `[ Exit ]` left half, `[ Retry ]`
-/// right half, a 2px top divider + a vertical mid divider in `pager`'s
-/// style. Exit (leave) is leftmost so it matches the gallery and the filter
-/// screens. Labels are bracketed ASCII (no glyph-coverage risk on a screen
-/// whose whole job is to be readable when things are broken).
+/// A two-zone button row: `[ Exit ]` left, `[ Retry ]` right, a 2px top divider
+/// and a vertical mid divider in `pager`'s style. Labels are bracketed ASCII,
+/// carrying no glyph-coverage risk.
 fn draw_buttons(fb: &mut Framebuffer, renderer: &mut TextRenderer) {
     let xres = fb.var.xres;
     let top = btn_top(fb.var.yres);
@@ -161,9 +136,8 @@ fn draw_buttons(fb: &mut Framebuffer, renderer: &mut TextRenderer) {
     renderer.draw(fb, rx, baseline, retry, false);
 }
 
-/// Draw the panel for `err`, then block until the user taps Retry or
-/// Exit. Called fresh on every failed `list_books` attempt, so the "Last"
-/// row always reflects the latest error across retries.
+/// The panel for `err`, blocking until a Retry or Exit tap. Called fresh per
+/// failed attempt, carrying the latest error into the "Last" row.
 pub fn run(
     fb: &mut Framebuffer,
     input: &mut Input,
@@ -185,7 +159,7 @@ pub fn run(
                 let _ = crate::eink::screenshot::capture(fb);
             }
             // Page buttons do nothing here, but they're grabbed by `Input`
-            // so they can't reach the framework and repaint over us.
+            // past the framework, which repaints over this window.
             InputEvent::Page(_) => {}
             // Idle tick — the diag panel is transient; ignore rotation here.
             InputEvent::Tick => {}

@@ -1,21 +1,12 @@
-//! Steb — search Standard Ebooks from the Kindle and download the `.azw3`.
-//!
-//! One screen: a paginated cover grid, with the keyboard, subject filter and
-//! sort picker as blocking overlay sub-loops. Hold a cover and it downloads —
-//! there is no detail page.
-//!
-//! The device layer is Linux-only (`libc::ioctl`'s request argument differs
-//! between BSD and Linux), so `eink/` and most of `ui/` are declared here
-//! rather than in `lib.rs`. Everything pure — the standardebooks.org client and
-//! the catalogue cache — lives in the library so `cargo test` runs on a host.
+//! Steb — search Standard Ebooks from the Kindle and download the `.azw3`. One
+//! paginated cover grid; `keyboard`, `filtermenu` and `sortmenu` open as
+//! blocking sub-loops. A held cover downloads, then `convert` writes a `.kfx`.
 
-// The `eink/` and `ui/` modules carry a few helpers the run loop does not
-// currently call — some input polling, a couple of geometry accessors. They are
-// kept so the modules stay whole and usable, and cost a few hundred bytes in a
-// stripped binary.
+// `eink` and `ui` carry helpers the run loop leaves uncalled.
 #![allow(dead_code)]
 
 mod cache;
+mod convert;
 mod cover_cache;
 mod eink;
 mod font;
@@ -41,44 +32,30 @@ use ui::sort::SortState;
 use ui::text::TextRenderer;
 use ui::{diag, filtermenu, grid, keyboard, pager, searchbar, toast};
 
-/// On-device extension bundle root — the cache lives under it.
+/// Extension bundle root, holding `crate::cache`.
 const BUNDLE_DIR: &str = "/mnt/us/extensions/steb";
-/// Where books land. A subfolder of `documents/` so Steb's downloads stay
-/// distinguishable from everything else in the library; the framework indexes
-/// it recursively either way.
+/// Where books land, a subfolder of `documents/`.
 const DOWNLOAD_DIR: &str = "/mnt/us/documents/standardebooks";
-/// Kindle's own cover thumbnails. Standard Ebooks names its thumbnail file
-/// after the azw3's ASIN, which is exactly the name the framework looks for, so
-/// the file drops in verbatim.
+/// Kindle's own cover thumbnails, taking a `ThumbnailHref::file_name` verbatim.
 const THUMBNAILS_DIR: &str = "/mnt/us/system/thumbnails";
-/// Where the launcher funnels this process's stderr. It creates the directory
-/// before the first write, so nothing here has to.
+/// Where `Steb.sh` funnels this process's stderr.
 const LOG_PATH: &str = "/mnt/us/logs/steb.log";
 
 const FONT_PX: f32 = 32.0;
 /// Headroom above the grid for the search bar.
 const TOP_MARGIN: u32 = searchbar::TOP + searchbar::HEIGHT + 16;
 
-/// How long a cover must be held — without drifting more than [`ARM_SLOP_PX`]
-/// from where the finger landed — before its download arms and fires.
-///
-/// A tap cannot download: the grid is a wall of covers with nothing else to
-/// touch, so a stray brush while reading the titles would fetch. The armed cue
-/// paints the instant the threshold passes and the download starts with it, so
-/// the gesture is "hold until the cover flips" — an over-long hold costs
-/// nothing and a too-short one is a visible non-event.
+/// How long a cover must be held, within [`ARM_SLOP_PX`], before its download
+/// arms and fires. A tap downloads nothing.
 const ARM_THRESHOLD: Duration = Duration::from_millis(1000);
-/// Max drift (either axis, user-visible px) from the landing point that still
-/// counts as a hold rather than a drag.
+/// Max drift in user-visible px, either axis, across a hold.
 const ARM_SLOP_PX: u32 = 40;
-/// How long the armed cue stays up before the download overlay paints over it,
-/// so the "held long enough" signal is actually seen.
+/// How long the armed cue holds the panel before the download overlay.
 const ARM_DWELL: Duration = Duration::from_millis(250);
-/// How long the hint after a too-short tap stays up.
+/// How long the hint after a too-short tap holds the panel.
 const TOAST_LINGER: Duration = Duration::from_millis(1200);
 
-/// Refresh rect for one grid cell, for the partial updates the press outline and
-/// the armed cue send.
+/// Refresh rect for one grid cell.
 fn cell_rect(cell_x: i32, cell_y: i32, cell_h: u32) -> MxcfbRect {
     MxcfbRect {
         top: cell_y.max(0) as u32,
@@ -88,24 +65,20 @@ fn cell_rect(cell_x: i32, cell_y: i32, cell_h: u32) -> MxcfbRect {
     }
 }
 
-/// A cover outlined under a finger, waiting to see whether the press becomes a
-/// hold. Release before [`ARM_THRESHOLD`] is a too-short tap and only shows the
-/// hint; holding past it auto-fires the download from the arm deadline.
+/// A cover outlined under a finger. A release before [`ARM_THRESHOLD`] draws
+/// the hint; a hold past it fires the download.
 struct Armed {
-    /// Slot on the current page, for redrawing that cell.
+    /// Slot on the current page.
     slot: usize,
     /// Index into `view.hits`.
     idx: usize,
     down_at: Instant,
-    /// Where the finger landed, so drift past [`ARM_SLOP_PX`] can cancel.
+    /// Where the finger landed, against [`ARM_SLOP_PX`].
     at: (u32, u32),
 }
 
-/// Write one line to stderr, which the launcher redirects into the log.
-///
-/// Deliberately *only* stderr, never [`LOG_PATH`] directly: the launcher
-/// already redirects `2>>` to that file, so writing it here too would put every
-/// line in twice.
+/// One line to stderr, which `Steb.sh` redirects into [`LOG_PATH`].
+/// Never [`LOG_PATH`] directly: that doubles every line.
 fn log(msg: impl AsRef<str>) {
     eprintln!("[{}] {}", now(), msg.as_ref());
 }
@@ -117,32 +90,21 @@ fn now() -> String {
         .unwrap_or_else(|_| "?".into())
 }
 
-/// What the grid is currently showing.
-///
-/// `hits` accumulates across Standard Ebooks pages: SE pages at 12–48 while the
-/// device grid pages at `layout.page_size()`, and the two must not be
-/// conflated. Hits append here, `pager` pages *this* vector, and the next SE
-/// page is pulled only when the user nears the end of it.
-///
-/// Grid page size is whatever the panel yields — never assume a figure. A
-/// Colorsoft reports 1272×1696, not the 1264×1680 its spec sheet implies, which
-/// is exactly why `grid::Layout::compute` derives everything from
-/// `fb.var.{xres,yres}` at runtime.
+/// What the grid draws. `hits` accumulates across SE pages; `pager` pages that
+/// vector at `layout.page_size()`.
 struct View {
     query: String,
     filters: Filters,
     sort: SortState,
     hits: Vec<Hit>,
     covers: Vec<Option<DynamicImage>>,
-    /// SE pages pulled so far.
+    /// SE pages pulled.
     fetched: u32,
-    /// Whether Standard Ebooks says another page exists. Driven by its own
-    /// `rel="next"` control rather than a page count, so paging does not depend
-    /// on how many links the nav happens to render.
+    /// SE's own `rel="next"` control.
     more: bool,
     /// Subject vocabulary, as parsed from the last listing page.
     tags: Vec<String>,
-    /// Filenames already in the download directory, so taken books read as taken.
+    /// `se::download::existing_files` over [`DOWNLOAD_DIR`].
     downloaded: Vec<String>,
 }
 
@@ -160,8 +122,8 @@ impl View {
         !self.query.trim().is_empty()
     }
 
-    /// Reset everything derived from a query/filter/sort change. The catalogue
-    /// cache is untouched — it is keyed by book, not by what we last searched.
+    /// Clears the fields a query, filter or sort change invalidates.
+    /// `crate::cache` is keyed by book and untouched.
     fn clear_results(&mut self) {
         self.hits.clear();
         self.covers.clear();
@@ -179,10 +141,7 @@ fn full_rect(fb: &Framebuffer) -> MxcfbRect {
     }
 }
 
-/// Run a request, unless there is plainly no network.
-///
-/// Returns the error the request itself would have produced, so call sites
-/// report it unchanged.
+/// `attempt`, guarded by [`net::is_offline`], carrying the request's own error.
 fn online<T>(attempt: impl FnOnce() -> se::http::Result<T>) -> se::http::Result<T> {
     if net::is_offline() {
         return Err(se::http::Error::Unreachable("Wi-Fi is off".into()));
@@ -190,11 +149,7 @@ fn online<T>(attempt: impl FnOnce() -> se::http::Result<T>) -> se::http::Result<
     attempt()
 }
 
-/// Run a network call, showing the Diagnostics screen on failure until the user
-/// either succeeds via Retry or taps Exit (`Ok(None)`).
-///
-/// This is why all device setup happens before the first request: `diag` needs
-/// a surface to draw on and `input` to take taps.
+/// `attempt` under [`diag`], retried until it succeeds or Exit returns `Ok(None)`.
 fn with_diag<T>(
     fb: &mut Framebuffer,
     input: &mut Input,
@@ -215,7 +170,7 @@ fn with_diag<T>(
     }
 }
 
-/// Pull the next Standard Ebooks page into `view`, if there is one.
+/// The next SE page into `view`, where `view.more` holds.
 fn fetch_next_page(
     client: &se::http::Client,
     view: &mut View,
@@ -246,10 +201,8 @@ fn fetch_next_page(
     Ok(())
 }
 
-/// Launch freshness check: one conditional GET against the public new-releases
-/// feed. When Standard Ebooks has published nothing since last launch this
-/// returns a 304 with no body and costs essentially nothing — which is the
-/// whole point, since the cache means we would otherwise never need to ask.
+/// One conditional GET against [`Endpoint::Feed`], answering 304 with no body
+/// against an unchanged catalogue.
 fn refresh_from_feed(client: &se::http::Client, catalogue: &mut cache::Catalogue) {
     let known = catalogue.feed.clone();
     match online(|| client.text_if_modified(&Endpoint::Feed, &known)) {
@@ -260,8 +213,7 @@ fn refresh_from_feed(client: &se::http::Client, catalogue: &mut cache::Catalogue
             log(format!("feed: {} entries, {state:?}", entries.len()));
             catalogue.feed = validators;
         }
-        // Never fatal: a failed freshness check just means we show what we
-        // already have, which is the entire reason the cache exists.
+        // Non-fatal: `catalogue` holds what the last launch stored.
         Err(e) => log(format!("feed check failed (non-fatal): {e}")),
     }
 }
@@ -273,7 +225,7 @@ fn label_of(hit: &Hit) -> grid::Label<'_> {
     }
 }
 
-/// Paint one page of the grid plus the search bar and pager strip.
+/// One page of the grid, plus `searchbar` and the `pager` strip.
 #[allow(clippy::too_many_arguments)]
 fn draw_page(
     fb: &mut Framebuffer,
@@ -290,10 +242,7 @@ fn draw_page(
     let end = (start + layout.page_size()).min(view.hits.len());
 
     if view.hits.is_empty() {
-        // Zero results is routine, not an error: Standard Ebooks has no typo
-        // tolerance, and typing on a device keyboard makes mistakes cheap. Say
-        // what was searched and point back at the keyboard, rather than showing
-        // an empty grid that looks broken.
+        // Zero hits under a query names the query and points at `keyboard`.
         let lh = renderer.line_height().max(1);
         let msg = if view.has_query() {
             format!("No books match \u{201c}{}\u{201d}", view.query)
@@ -321,8 +270,7 @@ fn draw_page(
             cover,
             label_of(&view.hits[idx]),
         );
-        // A book already in the library gets a corner check, so a second tap
-        // reads as redundant rather than silently re-downloading.
+        // [`is_downloaded`] draws a corner check.
         if is_downloaded(view, idx) {
             grid::draw_downloaded_badge(fb, rect);
         }
@@ -331,10 +279,8 @@ fn draw_page(
     pager::draw(fb, renderer, page, total_pages, view.filters.count());
 }
 
-/// Is this book already in `documents/standardebooks/`?
-///
-/// Matched on Standard Ebooks' own filename, which is stable per book — the
-/// same string we would write if the user tapped it.
+/// Is this book in [`DOWNLOAD_DIR`]? Matched on the stem, which the extension
+/// swap in `convert` leaves intact.
 fn is_downloaded(view: &View, idx: usize) -> bool {
     let Some(hit) = view.hits.get(idx) else {
         return false;
@@ -343,12 +289,8 @@ fn is_downloaded(view: &View, idx: usize) -> bool {
     view.downloaded.iter().any(|f| f.starts_with(&stem))
 }
 
-/// Fetch covers for the visible page, filling each cell as its image arrives.
-///
-/// Cells are painted as placeholders first and refreshed one at a time, so a
-/// slow link never blocks the grid from appearing. A cover is fetched at most
-/// once ever: the on-disk cache is keyed by the content hash in Standard
-/// Ebooks' own URL.
+/// Covers for the visible page, each cell refreshed as its image arrives.
+/// `cover_cache` is keyed by the content hash in the cover URL.
 fn fill_covers(
     fb: &mut Framebuffer,
     renderer: &mut TextRenderer,
@@ -360,10 +302,8 @@ fn fill_covers(
     let covers_dir = cache::covers_dir(Path::new(BUNDLE_DIR));
     let start = page * layout.page_size();
     let end = (start + layout.page_size()).min(view.hits.len());
-    // Asked once for the whole page rather than per cover: with no radio every
-    // uncached cover would spend the resolver's timeout reaching the same
-    // answer, and a page of them is a grid that takes a minute to give up.
-    // Cached covers are unaffected — they never touch the network.
+    // Asked once per page: an uncached cover with no radio spends the
+    // resolver's full timeout. A cached cover skips the network.
     let offline = net::is_offline();
 
     for idx in start..end {
@@ -381,7 +321,7 @@ fn fill_covers(
                     let _ = cover_cache::store(&covers_dir, &name, &b);
                     b
                 }
-                // A missing cover costs a placeholder, never the grid.
+                // A missing cover leaves the placeholder.
                 Err(e) => {
                     log(format!("cover {name}: {e}"));
                     continue;
@@ -421,12 +361,13 @@ fn fill_covers(
     Ok(())
 }
 
-/// Download one book: its page for the `.azw3` href, the file itself, then the
-/// Kindle thumbnail so it gets a real cover on the home screen.
+/// One book: its page for the `.azw3` href, the file, the Kindle thumbnail,
+/// then [`to_kfx`].
 fn download(
     fb: &mut Framebuffer,
     renderer: &mut TextRenderer,
     client: &se::http::Client,
+    conv: Option<&convert::Converter>,
     hit: &Hit,
 ) -> anyhow::Result<String> {
     let (rect, _) = toast::draw_download(fb, renderer, &hit.title, "Fetching…");
@@ -450,14 +391,16 @@ fn download(
     };
 
     let file_name = page.azw3.file_name().to_string();
-    match se::download::commit(Path::new(DOWNLOAD_DIR), &file_name, &bytes) {
-        Ok(path) => log(format!("downloaded {}", path.display())),
+    let azw3 = match se::download::commit(Path::new(DOWNLOAD_DIR), &file_name, &bytes) {
+        Ok(path) => {
+            log(format!("downloaded {}", path.display()));
+            path
+        }
         Err(e) => return Ok(format!("Failed: {e}")),
-    }
+    };
 
-    // Best-effort cover for the home screen. SE's filename already carries the
-    // ASIN the framework expects, so it is written verbatim. A failure here
-    // costs a grey placeholder in the library, never the book.
+    // `ThumbnailHref::file_name` is written verbatim. A failure leaves the
+    // grey placeholder.
     if let Some(thumb) = page.thumbnail {
         match client.bytes(&Endpoint::Thumbnail(thumb.clone())) {
             Ok(b) => {
@@ -470,11 +413,40 @@ fn download(
         }
     }
 
+    let file_name = match conv {
+        Some(c) => to_kfx(fb, renderer, c, &hit.title, &azw3)?.unwrap_or(file_name),
+        None => file_name,
+    };
+
     Ok(finish(&file_name))
 }
 
+/// `conv.convert(azw3)` under a banner, returning the `.kfx` file name.
+/// A [`convert::Error`] goes to [`log`] and returns `None`, leaving `azw3`.
+fn to_kfx(
+    fb: &mut Framebuffer,
+    renderer: &mut TextRenderer,
+    conv: &convert::Converter,
+    title: &str,
+    azw3: &Path,
+) -> anyhow::Result<Option<String>> {
+    let rect = toast::draw_download_done(fb, renderer, &format!("{title}\nConverting to KFX…"));
+    fb.send_update(rect, WAVEFORM_MODE_GC16)?;
+
+    match conv.convert(azw3) {
+        Ok(kfx) => {
+            log(format!("converted {}", kfx.display()));
+            Ok(kfx.file_name().map(|n| n.to_string_lossy().into_owned()))
+        }
+        Err(e) => {
+            log(format!("convert {}: {e}", azw3.display()));
+            Ok(None)
+        }
+    }
+}
+
 fn finish(file_name: &str) -> String {
-    // Without this the file sits on disk and never appears in the library.
+    // [`se::download::request_reindex`] puts the file in the library.
     se::download::request_reindex();
     format!("Downloaded {file_name}")
 }
@@ -490,10 +462,8 @@ fn run() -> anyhow::Result<()> {
     log(format!("steb {} starting", env!("CARGO_PKG_VERSION")));
 
     // ---- Device setup, before any network call -------------------------
-    // The Diagnostics screen needs a surface and input to be usable, so every
-    // piece of device state is up before the first request. The bezel grab in
-    // particular must precede it, or a button press leaks to the framework and
-    // repaints the home library over whatever we are showing.
+    // [`diag`] needs a surface and input. The `Buttons` grab precedes both: an
+    // ungrabbed press repaints the home library over this window.
     let mut renderer = TextRenderer::load(FONT_PX)?;
     log(format!("fonts: {}", renderer.chain_description()));
 
@@ -517,6 +487,13 @@ fn run() -> anyhow::Result<()> {
     let mut input = Input::new(touch, buttons);
     input.set_orientation(orient);
 
+    // `converter` is `None` where bokai is not installed at `convert::BIN_PATH`.
+    let converter = convert::locate();
+    match &converter {
+        Some(c) => log(format!("converter: {}", c.exe().display())),
+        None => log(format!("converter: none at {}", convert::BIN_PATH)),
+    }
+
     // ---- Cache + first fetch -------------------------------------------
     let cat_path = cache::catalogue_path(Path::new(BUNDLE_DIR));
     let mut catalogue = cache::load(&cat_path);
@@ -537,9 +514,7 @@ fn run() -> anyhow::Result<()> {
         downloaded: se::download::existing_files(Path::new(DOWNLOAD_DIR)),
     };
 
-    // Opens on bare /ebooks — the latest releases — so the first screen is a
-    // full grid of covers with no user input at all. This is the request the
-    // Diagnostics screen exists for, and the only one that blocks startup.
+    // Bare `/ebooks`, the one request blocking startup.
     if with_diag(&mut fb, &mut input, &mut renderer, || {
         online(|| fetch_next_page(&client, &mut view, &mut catalogue))
     })?
@@ -569,7 +544,7 @@ fn run() -> anyhow::Result<()> {
         }};
     }
 
-    /// Pull more results when the user reaches the end of what we have.
+    /// More results as `page` nears the end of `view.hits`.
     macro_rules! ensure_page {
         ($p:expr) => {{
             let needed = ($p + 1) * layout.page_size();
@@ -583,8 +558,7 @@ fn run() -> anyhow::Result<()> {
         }};
     }
 
-    // The strip, the bezel buttons and a swipe all turn pages, and must agree on
-    // what that means — including pulling the next SE page before stepping in.
+    // Shared by the strip, the bezel buttons and a swipe.
     macro_rules! next_page {
         () => {{
             ensure_page!(page + 1);
@@ -603,8 +577,7 @@ fn run() -> anyhow::Result<()> {
         }};
     }
 
-    /// Repaint one cell in place, to drop a press outline without `repaint!`
-    /// flashing the whole panel for a 360×440 change.
+    /// One cell in place, past `repaint!` and its full-panel flash.
     macro_rules! redraw_cell {
         ($slot:expr) => {{
             let slot = $slot;
@@ -628,31 +601,24 @@ fn run() -> anyhow::Result<()> {
         }};
     }
 
-    // The cover under the finger, if any.
     let mut armed: Option<Armed> = None;
-    // Where the current stroke landed, so the matching `Up` can tell a press
-    // from a page-flip swipe. Set on every `Down`, taken on every `Up`.
+    // Set on every `Down`, taken on every `Up`.
     let mut down_pos: Option<(u32, u32)> = None;
 
     loop {
-        // While a cover is held, wake the loop at the arm instant so the cue can
-        // flip and the download fire on its own. A `Tick` otherwise never
-        // arrives mid-hold: finger micro-jitter keeps `poll` busy.
+        // A deadline at the arm instant. Finger micro-jitter keeps `poll` busy
+        // through a hold, and no `Tick` arrives on its own.
         let deadline = armed.as_ref().map(|a| a.down_at + ARM_THRESHOLD);
         match input.next_deadline(deadline)? {
             InputEvent::Touch(TouchEvent::Up { x, y }) => {
-                // A horizontal swipe flips the page — the page-turn affordance a
-                // buttonless Colorsoft otherwise lacks. Checked before the press
-                // the `Down` armed, so a deliberate drag across the grid turns
-                // the page instead of scolding the user to hold longer.
-                // `take()` ends this stroke either way.
+                // A horizontal swipe flips the page, checked ahead of the press
+                // the `Down` armed. `take()` ends this stroke either way.
                 if let Some(dir) = down_pos
                     .take()
                     .and_then(|(x0, y0)| classify_swipe(x0, y0, x, y, fb.var.xres))
                 {
-                    // Cancel whatever the `Down` armed. At a page boundary the
-                    // turn is a no-op, so the press outline still has to be
-                    // cleared by hand or it stays on screen.
+                    // At a page boundary the turn is a no-op and the press
+                    // outline wants clearing by hand.
                     let stale = armed.take().map(|a| a.slot);
                     log(format!("swipe {dir:?} on page {page}"));
                     let before = page;
@@ -668,8 +634,8 @@ fn run() -> anyhow::Result<()> {
                     continue;
                 }
 
-                // A hold long enough to act already fired from the `Tick` arm and
-                // cleared this, so a cover still armed here was released early.
+                // A `Tick` arm clears `armed`. A cover armed here was released
+                // inside [`ARM_THRESHOLD`].
                 if let Some(a) = armed.take() {
                     log(format!(
                         "short tap ({:?}), showing hint",
@@ -678,11 +644,11 @@ fn run() -> anyhow::Result<()> {
                     let dirty = toast::draw(&mut fb, &mut renderer, "Hold cover to download");
                     fb.send_update(dirty, WAVEFORM_MODE_GC16)?;
                     std::thread::sleep(TOAST_LINGER);
-                    // Clears both the toast and the outline the press left.
+                    // Clears the toast and the press outline together.
                     repaint!();
                     continue;
                 }
-                // Search bar first — it sits above the grid.
+                // `searchbar` sits above the grid.
                 if let Some(tap) = searchbar::hit(x, y, fb.var.xres, !view.query.is_empty()) {
                     match tap {
                         searchbar::Tap::Clear => {
@@ -755,16 +721,12 @@ fn run() -> anyhow::Result<()> {
                     continue;
                 }
 
-                // A lift on a cover does nothing: downloading is the hold, armed
-                // on `Down` and fired from the arm deadline in `Tick`.
+                // A lift on a cover does nothing: the download fires from `Tick`.
             }
             InputEvent::Touch(TouchEvent::Down { x, y }) => {
-                // Every stroke's landing point, wherever it starts: the matching
-                // `Up` needs both ends to tell a press from a swipe, and a swipe
-                // may well begin in a margin or on the strip.
+                // Every stroke's landing point, margins and strip included.
                 down_pos = Some((x, y));
-                // Outline the cover so the press is acknowledged immediately;
-                // whether it downloads is decided by how long the finger stays.
+                // An outline under the press, ahead of [`ARM_THRESHOLD`].
                 if searchbar::hit(x, y, fb.var.xres, !view.query.is_empty()).is_none()
                     && pager::hit(x, y, fb.var.xres, fb.var.yres, total_pages).is_none()
                     && let Some(slot) = layout.cell_at_tap(x, y, view.hits.len())
@@ -791,17 +753,14 @@ fn run() -> anyhow::Result<()> {
                 PageButton::Prev => prev_page!(),
             },
             InputEvent::Tick => {
-                // Either the arm deadline came up while a cover was held, or it
-                // is an ordinary idle poll and only the orientation needs a look.
+                // The arm deadline, or an idle poll reaching the orientation check.
                 if armed
                     .as_ref()
                     .is_some_and(|a| a.down_at.elapsed() >= ARM_THRESHOLD)
                 {
                     let a = armed.take().expect("checked above");
-                    // A finger that wandered off its landing point is dragging,
-                    // not holding — cancel and clear the outline. Only that cell
-                    // is repainted: the drag is very often a slow swipe, and its
-                    // `Up` is about to turn the page for real.
+                    // Drift past [`ARM_SLOP_PX`] is a drag. One cell repaints:
+                    // its `Up` is often a page-turn swipe.
                     let (px, py) = input.touch_pos();
                     if px.abs_diff(a.at.0) > ARM_SLOP_PX || py.abs_diff(a.at.1) > ARM_SLOP_PX {
                         log(format!(
@@ -815,23 +774,20 @@ fn run() -> anyhow::Result<()> {
                         repaint!();
                         continue;
                     };
-                    // Flip the cover to the armed cue and let it show before the
-                    // download overlay covers it, so the signal is actually seen.
+                    // The armed cue holds for [`ARM_DWELL`] under the overlay.
                     let (cx, cy) = layout.cell_xy(a.slot);
                     if cx >= 0 && cy >= 0 {
                         grid::draw_arm_cue(&mut fb, cx, cy, layout.cell_h);
                         fb.send_update(cell_rect(cx, cy, layout.cell_h), WAVEFORM_MODE_DU)?;
                         std::thread::sleep(ARM_DWELL);
                     }
-                    // Fire while the finger is still down. Its eventual lift is
-                    // inert: `armed` is already taken, and a lift on the grid
-                    // does nothing.
+                    // Fires under the finger. The lift finds `armed` taken.
                     log(format!(
                         "arm fired ({:?}) on {}",
                         a.down_at.elapsed(),
                         hit.title
                     ));
-                    let msg = download(&mut fb, &mut renderer, &client, &hit)?;
+                    let msg = download(&mut fb, &mut renderer, &client, converter.as_ref(), &hit)?;
                     log(&msg);
                     let rect = toast::draw_download_done(&mut fb, &mut renderer, &msg);
                     fb.send_update(rect, WAVEFORM_MODE_GC16)?;

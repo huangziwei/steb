@@ -1,33 +1,21 @@
-//! Fetch an azw3 and commit it to the device library.
-//!
-//! Two things here are not obvious:
-//!
-//! 1. The bare `.azw3` URL does **not** serve the file. It returns a ~10 KB
-//!    "Your Download Has Started!" page whose meta refresh points back at the
-//!    same URL with `?source=download`. [`super::url::Endpoint::Download`]
-//!    appends that, so this module never sees the interstitial — but it still
-//!    checks, because a silently-HTML "azw3" landing in the library would be a
-//!    confusing failure to diagnose later.
-//! 2. The framework does not notice a new file on its own. `touch`ing
-//!    `/mnt/us/system/.cleanindex` is what makes it index one, and without that
-//!    the book simply never appears on the home screen.
+//! An azw3 verified by [`is_ebook`], committed to `dir` by [`commit`], and
+//! indexed on the next [`request_reindex`].
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// MOBI8 magic at offset 0x3c of a PalmDOC header. An azw3 is a MOBI8
-/// container, so this is present in every file SE produces.
+/// Offset of the MOBI8 magic in a PalmDOC header.
 const BOOKMOBI_OFFSET: usize = 0x3c;
 const BOOKMOBI_MAGIC: &[u8] = b"BOOKMOBI";
 
-/// Touching this is what tells the framework to re-index `documents/`.
+/// Appended to by [`request_reindex`] to re-index `documents/`.
 pub const CLEANINDEX: &str = "/mnt/us/system/.cleanindex";
 
 #[derive(Debug)]
 pub enum Error {
-    /// The bytes are not a Kindle book. In practice this means SE served an
-    /// interstitial or an error page under a `.azw3` name.
+    /// `bytes` carry no [`BOOKMOBI_MAGIC`]: an interstitial or an error page
+    /// under a `.azw3` name.
     NotAnEbook,
     Io(io::Error),
 }
@@ -49,19 +37,15 @@ impl From<io::Error> for Error {
     }
 }
 
-/// Does this look like a real azw3?
+/// [`BOOKMOBI_MAGIC`] at [`BOOKMOBI_OFFSET`].
 pub fn is_ebook(bytes: &[u8]) -> bool {
     bytes
         .get(BOOKMOBI_OFFSET..BOOKMOBI_OFFSET + BOOKMOBI_MAGIC.len())
         .is_some_and(|m| m == BOOKMOBI_MAGIC)
 }
 
-/// Write `bytes` into `dir` as `file_name`, verifying first.
-///
-/// The write is atomic: bytes land in a `.partial` sibling and are renamed over
-/// the target. The user partition is FAT, so a crash or a yanked USB cable
-/// mid-write would otherwise leave a truncated file that the framework happily
-/// indexes as a corrupt book.
+/// [`is_ebook`] over `bytes`, then a `.partial` sibling in `dir` renamed to
+/// `file_name`.
 pub fn commit(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<PathBuf, Error> {
     if !is_ebook(bytes) {
         return Err(Error::NotAnEbook);
@@ -74,9 +58,7 @@ pub fn commit(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<PathBuf, Erro
     Ok(dest)
 }
 
-/// Ask the framework to index what we just wrote. Best-effort: a failure here
-/// means the book is on disk but not yet on the home screen, which the next
-/// reboot fixes — never worth failing a completed download over.
+/// Appends to [`CLEANINDEX`]. A failed open is dropped.
 pub fn request_reindex() {
     let _ = fs::OpenOptions::new()
         .create(true)
@@ -84,8 +66,10 @@ pub fn request_reindex() {
         .open(CLEANINDEX);
 }
 
-/// Names already present in the download directory, so the grid can mark books
-/// the user has taken. Keyed on SE's own filename, which is stable per book.
+/// What [`commit`] writes, and what `crate::convert` leaves in its place.
+pub const TAKEN_SUFFIXES: [&str; 2] = [".azw3", ".kfx"];
+
+/// Names in `dir` ending in a [`TAKEN_SUFFIXES`] entry.
 pub fn existing_files(dir: &Path) -> Vec<String> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
@@ -93,7 +77,7 @@ pub fn existing_files(dir: &Path) -> Vec<String> {
     entries
         .flatten()
         .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| n.ends_with(".azw3"))
+        .filter(|n| TAKEN_SUFFIXES.iter().any(|s| n.ends_with(s)))
         .collect()
 }
 
@@ -101,7 +85,7 @@ pub fn existing_files(dir: &Path) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// Smallest byte string that satisfies the magic check.
+    /// The shortest bytes [`is_ebook`] accepts.
     fn fake_azw3() -> Vec<u8> {
         let mut v = vec![0u8; BOOKMOBI_OFFSET];
         v.extend_from_slice(BOOKMOBI_MAGIC);
@@ -117,8 +101,6 @@ mod tests {
 
     #[test]
     fn the_real_interstitial_is_rejected() {
-        // The exact page the bare .azw3 URL serves — this is the failure the
-        // magic check exists to catch.
         let interstitial = include_bytes!("../../tests/fixtures/download-interstitial.html");
         assert!(!is_ebook(interstitial));
     }
@@ -150,6 +132,17 @@ mod tests {
             existing_files(&dir).is_empty(),
             "nothing should be written when verification fails"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_converted_book_reads_as_taken_and_a_partial_does_not() {
+        let dir = tmpdir("converted");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("bram-stoker_dracula.kfx"), b"kfx").unwrap();
+        fs::write(dir.join("homer_the-iliad.kfx.partial"), b"half").unwrap();
+
+        assert_eq!(existing_files(&dir), vec!["bram-stoker_dracula.kfx"]);
         let _ = fs::remove_dir_all(&dir);
     }
 

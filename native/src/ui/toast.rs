@@ -1,48 +1,30 @@
-//! Modal status overlay.
-//!
-//! Black banner centered on the panel with white text — used during downloads
-//! ("Downloading…", "Downloaded", "Failed"). A message is laid out one row per
-//! `\n`-delimited line: callers compose results by joining clauses with `\n`,
-//! and a newline handed to the renderer instead would draw as the
-//! missing-glyph box (no face has U+000A). Returns the dirty rect so the
-//! caller can refresh just that area.
-//!
-//! [`draw_download`] is the taller live variant: a title line, a
-//! `transferred / total` progress line, and a tappable Cancel button.
-//! [`draw_progress`] is the batch-step variant: a title, an `n / total` count,
-//! and a filled progress bar (no Cancel) — the DRM Decrypt-All step indicator.
+//! Modal status overlay: a black banner centered on the panel, white text.
+//! A `message` lays out one row per `\n`-delimited line. Every function here
+//! returns the dirty rect.
 
 use crate::eink::fb::{Framebuffer, MxcfbRect};
 use crate::ui::text::TextRenderer;
 
 const BANNER_HEIGHT: u32 = 140;
 const BANNER_MARGIN_X: u32 = 80;
-/// Breathing room above and below the text block, and so the least height a
-/// banner may take beyond the block it holds. Only a message taller than
-/// [`BANNER_HEIGHT`] is affected: everything shorter keeps the one-line
-/// footprint, which is what lets one plain toast overwrite another exactly.
+/// Padding above and below the text block, past [`BANNER_HEIGHT`].
 const BANNER_PAD_Y: u32 = 20;
 
-/// Taller banner for the live download overlay — fits title + progress + the
-/// Cancel button with breathing room.
+/// [`draw_download`]: a title, a progress line, and the Cancel button.
 const DL_BANNER_HEIGHT: u32 = 300;
 
-/// Banner for the batch-progress overlay ([`draw_progress`]) — fits a title, an
-/// `n / total` count, and the progress bar.
+/// [`draw_progress`]: a title, an `n / total` count, and the bar.
 const PROGRESS_BANNER_HEIGHT: u32 = 260;
 /// Horizontal inset of the progress bar from the banner's side edges.
 const PROGRESS_BAR_INSET: u32 = 60;
 /// Progress-bar track height.
 const PROGRESS_BAR_H: u32 = 44;
-/// Cancel button footprint. Sized for a comfortable finger target on a
-/// ~300 DPI panel (the stock reader's tap targets are in this range).
+/// Cancel button footprint, a finger target on a ~300 DPI panel.
 const CANCEL_W: u32 = 320;
 const CANCEL_H: u32 = 84;
 
 pub fn draw(fb: &mut Framebuffer, renderer: &mut TextRenderer, message: &str) -> MxcfbRect {
-    // At least the one-line footprint, so the ordinary toast still overwrites
-    // the overlay it replaces exactly; taller only when the text needs it,
-    // which beats spilling white rows outside the black box.
+    // [`BANNER_HEIGHT`] as a floor, taller for a `message` past it.
     let banner_h = BANNER_HEIGHT.max(block_height(renderer, message) + BANNER_PAD_Y * 2);
     let banner_w = fb.var.xres.saturating_sub(BANNER_MARGIN_X * 2);
     let banner_x = (fb.var.xres - banner_w) / 2;
@@ -61,16 +43,13 @@ pub fn draw(fb: &mut Framebuffer, renderer: &mut TextRenderer, message: &str) ->
     }
 }
 
-/// Height of `message` laid out one row per line, never less than one row so
-/// an empty message still reserves the line it would have drawn on.
+/// `message` at one row per line, a minimum of one row.
 fn block_height(renderer: &TextRenderer, message: &str) -> u32 {
     renderer.line_height() * message.lines().count().max(1) as u32
 }
 
-/// Center `message` as a block inside the banner, one row per `\n`-delimited
-/// line, each row centered on its own width. White-on-black, matching every
-/// banner here. Shared so the plain toast and the download overlay's terminal
-/// banner lay text out identically and differ only in footprint.
+/// `message` centered as a block in the banner, each row centered on its own
+/// width, white-on-black.
 fn draw_message_block(
     fb: &mut Framebuffer,
     renderer: &mut TextRenderer,
@@ -85,19 +64,14 @@ fn draw_message_block(
     for (i, line) in message.lines().enumerate() {
         let text_w = renderer.measure_width(line);
         let text_x = banner_x as i32 + ((banner_w as i32 - text_w as i32) / 2).max(0);
-        // Baseline ~72% down each line's slot — headroom for ascenders, and a
-        // little descender clearance.
+        // Baseline 72% down the slot, clearing ascenders and descenders.
         let baseline = (block_top + lh * i as u32 + lh * 72 / 100) as i32;
         renderer.draw(fb, text_x, baseline, line, true);
     }
 }
 
-/// Live download overlay: a `title` line, a `progress` line
-/// (`transferred / total`), and a white Cancel button below them. Returns the
-/// banner's dirty rect (send it to the panel) **and** the Cancel button's
-/// absolute-coordinate hit rect, so the caller can test a tap against it while
-/// the transfer runs. The button is white-on-black-banner (inverted from the
-/// banner) so it reads as a tappable control.
+/// A `title` line, a `progress` line, and a white Cancel button.
+/// Returns the banner's dirty rect and the Cancel button's absolute hit rect.
 pub fn draw_download(
     fb: &mut Framebuffer,
     renderer: &mut TextRenderer,
@@ -145,14 +119,8 @@ pub fn draw_download(
     (banner_rect, cancel_rect)
 }
 
-/// Terminal state of the live download overlay. Reuses [`draw_download`]'s
-/// banner footprint (same width, height, position) so it paints directly over
-/// the running progress/Cancel overlay and leaves none of its edges behind —
-/// the "Downloaded"/"Failed" result and the live overlay are one banner in one
-/// place, not a smaller toast stacked inside the taller one. `message` is
-/// centered as a block, one row per `\n`-delimited line (so multi-line results
-/// like the token-mismatch hint read as real lines, not a stray glyph), with no
-/// Cancel button. Returns the banner's dirty rect.
+/// `message` in [`draw_download`]'s footprint — same width, height and
+/// position — with no Cancel button.
 pub fn draw_download_done(
     fb: &mut Framebuffer,
     renderer: &mut TextRenderer,
@@ -181,11 +149,8 @@ pub fn draw_download_done(
     }
 }
 
-/// Batch-progress overlay: a `title` line, an `n / total` count line, and a
-/// progress bar filled to `done / total`. White-on-black to match the other
-/// banners; no Cancel (a decrypt runs to completion). Used by the DRM view's
-/// Decrypt-All button, which steps through every on-device purchase. Returns the
-/// banner's dirty rect. `total == 0` draws an empty track (no divide-by-zero).
+/// A `title` line, an `n / total` count, and a bar filled to `done / total`.
+/// `total == 0` draws an empty track.
 pub fn draw_progress(
     fb: &mut Framebuffer,
     renderer: &mut TextRenderer,

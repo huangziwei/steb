@@ -1,18 +1,6 @@
-//! Sort-picker overlay.
-//!
-//! Full-screen list of the sort options (tap to select) + a `[ Done ]` strip. Blocking sub-loop in the `ui/diag.rs` mold: a pure
-//! `hit` geometry fn, a `render` that paints the whole panel, and a `run` that
-//! owns input until the user taps Done — at which point the caller rebuilds the
-//! view and repaints the grid.
-//!
-//! Refresh discipline mirrors the grid: one full GC16 on open (and on a
-//! detected rotation, to clear the blank the X server leaves), but in-menu
-//! selection changes repaint only the list region with a fast DU partial — no
-//! full-screen flash per tap.
-//!
-//! Rotation is handled here, not by the main loop: while this sub-loop owns
-//! input, the main loop's `Tick` re-orient path can't run, so on a `Tick` we
-//! re-detect orientation, re-orient the input devices, and repaint ourselves.
+//! Sort-picker overlay: a full-screen list over a `[ Done ]` strip, shaped like
+//! [`crate::ui::diag`]. GC16 on open and on rotation, a list-region DU on a
+//! selection change. A `Tick` re-detects orientation here.
 
 use crate::eink::fb::{Framebuffer, MxcfbRect, WAVEFORM_MODE_DU, WAVEFORM_MODE_GC16};
 use crate::eink::input::{Input, InputEvent};
@@ -26,11 +14,8 @@ const STRIP_H: u32 = 120;
 /// Left inset for the title and row labels.
 const MARGIN_X: u32 = 60;
 
-/// What a tap resolved to.
-///
-/// There is no direction toggle: Standard Ebooks bakes the direction into each
-/// option it offers ("Author name (a → z)", "Length (short → long)"), so there
-/// is nothing to flip and such a row would be a lie.
+/// What a tap resolved to. SE bakes direction into each option it offers
+/// ("Author name (a → z)"), leaving no direction row.
 enum Tap {
     /// Index into the caller's row list.
     Row(usize),
@@ -138,13 +123,9 @@ fn draw_done(fb: &mut Framebuffer, renderer: &mut TextRenderer, layout: &Layout)
     renderer.draw(fb, x, baseline, label, false);
 }
 
-/// Draw the sort picker seeded with `initial`, then block until Done. Returns
-/// the chosen `SortState` (equal to `initial` if nothing was changed — the
-/// caller no-ops a same-state result rather than rebuilding the view). `orient`
-/// is kept in sync so the caller's rotation tracking stays correct.
-/// `has_query` decides whether the Relevance row is offered at all: Standard
-/// Ebooks only accepts that sort alongside a query, so while browsing it is
-/// omitted rather than shown and silently ignored.
+/// The sort picker seeded with `initial`, blocking until Done and returning the
+/// chosen `SortState`. `orient` tracks rotation for the caller. `has_query`
+/// gates the Relevance row, a sort SE accepts alongside a query alone.
 pub fn run(
     fb: &mut Framebuffer,
     input: &mut Input,
@@ -173,7 +154,7 @@ pub fn run(
                     fb.send_update(rect, WAVEFORM_MODE_DU)?;
                 }
                 Some(Tap::Done) => return Ok(state),
-                // Tapping the already-selected row / no hit — nothing to do.
+                // The selected row, or no hit.
                 Some(Tap::Row(_)) | None => {}
             },
             InputEvent::Touch(TouchEvent::Down { .. }) => {}

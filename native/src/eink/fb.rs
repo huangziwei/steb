@@ -1,30 +1,6 @@
-//! Display surface — a WM-managed fullscreen X11 window.
-//!
-//! Drawing goes through the window rather than a `/dev/fb0` mmap, so the
-//! lab126 compositor owns the surface: it shows us fullscreen and recomposites
-//! the whole screen — home library and status bar — when the window is torn
-//! down on exit. Nothing here freezes or paints over the framework.
-//!
-//! The compositor ALSO auto-rotates our window 180° to the framework
-//! orientation (page-bezel side), so we render identity here and never rotate
-//! pixels ourselves — doing so would double-rotate. Touch/buttons are read raw
-//! from evdev (panel-fixed), so the main loop re-orients *those* on rotation;
-//! see [`crate::eink::input`]. The renderer draws into a packed-RGB backing
-//! ([`CH`] bytes/pixel, white=255). The chrome (text, frames, bands) writes gray
-//! via [`Framebuffer::put_pixel`] / [`Framebuffer::fill_rect`] (R=G=B), while
-//! cover art writes true color via [`Framebuffer::put_pixel_rgb`] — so the
-//! Colorsoft shows color covers under a grayscale UI.
-//!
-//! How the backing reaches the server depends on the window depth: a color panel
-//! (Colorsoft — `/dev/fb0` is 32bpp, X runs depth 24/32) takes the RGB reordered
-//! to the visual's channel masks plus a pad byte; a grayscale panel (KOA2, depth
-//! 8) takes a per-pixel luma collapse (a gray UI pixel passes through exactly;
-//! the rare color cover desaturates). `send_update` does that conversion per
-//! band. A paint goes as one request (BIG-REQUESTS), so the server sees one
-//! damage region rather than several. Type/
-//! method names (`Framebuffer`, `MxcfbRect`, `send_update`) are kept so the
-//! renderer is unchanged; the X server drives the eink refresh, so the waveform
-//! is ignored.
+//! Display surface: a WM-managed fullscreen X11 window. Drawing lands in a
+//! packed-RGB backing ([`CH`] bytes/pixel, white=255) and reaches the server
+//! through [`Framebuffer::send_update`]. Rendering is identity.
 
 use std::path::Path;
 
@@ -42,31 +18,25 @@ use x11rb::rust_connection::RustConnection;
 // `change_property8` lives in the wrapper `ConnectionExt`.
 use x11rb::wrapper::ConnectionExt as _;
 
-// Waveform constants kept for call-site compatibility — the X server now picks
-// the eink waveform, so `send_update` accepts and ignores these.
+// [`Framebuffer::send_update`] accepts and ignores these.
 #[allow(dead_code)]
 pub const WAVEFORM_MODE_INIT: u32 = 0;
 pub const WAVEFORM_MODE_DU: u32 = 1;
 pub const WAVEFORM_MODE_GC16: u32 = 2;
 
-/// Bytes per pixel in the backing store: packed RGB (no alpha). The wire format
-/// is derived per-depth in `send_update` (luma for depth-8, masked RGBX for
-/// depth-24/32), so the backing stays a compact device-independent RGB.
+/// Bytes per pixel in the backing store: packed RGB, no alpha.
 pub const CH: usize = 3;
 
-/// Rec. 601 luma of an RGB pixel (the depth-8 wire collapse). A gray UI pixel
-/// (R=G=B) maps to itself exactly; a color cover desaturates. `>> 8` with these
-/// weights summing to 256 keeps it an integer multiply-shift.
+/// Rec. 601 luma, the depth-8 wire collapse. The weights sum to 256, keeping
+/// `>> 8` an integer multiply-shift.
 #[inline]
 fn luma(r: u8, g: u8, b: u8) -> u8 {
     ((r as u32 * 77 + g as u32 * 150 + b as u32 * 29) >> 8) as u8
 }
 
-/// Resolve the R/G/B byte offsets within a `bpp`-wide wire pixel from the root
-/// visual's colour masks, honouring the server image byte order. `None` when
-/// the format is sub-RGB (depth-8 — that path collapses to luma, so the masks
-/// don't matter) or the visual/masks can't be read, letting the caller fall
-/// back to a default layout.
+/// R/G/B byte offsets within a `bpp`-wide wire pixel, from the root visual's
+/// colour masks under the server image byte order. `None` on depth-8 and on an
+/// unreadable visual.
 fn wire_channels(conn: &RustConnection, screen: &Screen, bpp: usize) -> Option<[usize; 3]> {
     if bpp < 3 {
         return None;
@@ -80,9 +50,8 @@ fn wire_channels(conn: &RustConnection, screen: &Screen, bpp: usize) -> Option<[
         return None;
     }
     let msb = conn.setup().image_byte_order == ImageOrder::MSB_FIRST;
-    // A channel's mask sits in one byte of the native-endian pixel; its byte
-    // index is the mask's trailing-zero count / 8. MSBFirst wire order mirrors
-    // that index across the pixel width.
+    // A mask sits in one byte of the native-endian pixel, at index
+    // `trailing_zeros / 8`. MSBFirst mirrors that index across the width.
     let offset = |mask: u32| -> usize {
         let idx = (mask.trailing_zeros() / 8) as usize;
         if msb { bpp - 1 - idx } else { idx }
@@ -94,8 +63,7 @@ fn wire_channels(conn: &RustConnection, screen: &Screen, bpp: usize) -> Option<[
     ])
 }
 
-/// A rectangle to present, in screen coords. Not an MXCFB struct, despite the
-/// name the renderer knows it by.
+/// A rectangle to present, in screen coords.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct MxcfbRect {
     pub top: u32,
@@ -106,8 +74,7 @@ pub struct MxcfbRect {
     pub height: u32,
 }
 
-/// Minimal geometry, exposed as `fb.var.xres` / `fb.var.yres` like the old
-/// fbdev `var`, so the renderer is unchanged.
+/// Geometry, reached as `fb.var.xres` / `fb.var.yres`.
 pub struct Var {
     pub xres: u32,
     pub yres: u32,
@@ -118,19 +85,14 @@ pub struct Framebuffer {
     win: Window,
     gc: Gcontext,
     depth: u8,
-    /// Server wire bytes per pixel for `depth` (from `pixmap_formats`): 1 on a
-    /// depth-8 panel, 4 on depth-24/32. `send_update` converts the RGB backing
-    /// to this width.
+    /// Wire bytes per pixel for `depth`, from `pixmap_formats`: 1 on depth-8,
+    /// 4 on depth-24/32.
     bytes_per_pixel: usize,
-    /// Byte offset of the R, G, B channels within a `bytes_per_pixel`-wide wire
-    /// pixel, derived from the visual's colour masks under the server image byte
-    /// order. Typical depth-24 little-endian is BGRX → `[2, 1, 0]`. Unused on
-    /// depth-8 (that path collapses to luma).
+    /// R, G, B offsets within a `bytes_per_pixel`-wide wire pixel. Depth-24
+    /// little-endian BGRX is `[2, 1, 0]`. Unused on depth-8.
     chan: [usize; 3],
     pub var: Var,
-    /// Packed RGB ([`CH`] bytes/pixel), stride == `xres * CH`. All drawing writes
-    /// here; `send_update` `PutImage`s the dirty rows to the window in the wire
-    /// format.
+    /// Packed RGB ([`CH`] bytes/pixel), stride `xres * CH`. Every draw writes here.
     backing: Vec<u8>,
     /// Per-`PutImage` byte budget (server max request length minus header slack).
     max_req_bytes: usize,
@@ -144,9 +106,7 @@ impl Framebuffer {
         let xres = screen.width_in_pixels as u32;
         let yres = screen.height_in_pixels as u32;
         let depth = screen.root_depth;
-        // Wire bytes per pixel the server expects for this depth. Depth 8 → 1;
-        // depth 24/32 → 4 (X pads 24-bit pixels to 32). Looked up rather than
-        // assumed so `send_update` adapts to whatever the panel's X exposes.
+        // Depth 8 → 1; depth 24/32 → 4, X padding 24-bit pixels to 32.
         let bytes_per_pixel = conn
             .setup()
             .pixmap_formats
@@ -154,11 +114,9 @@ impl Framebuffer {
             .find(|f| f.depth == depth)
             .map(|f| (f.bits_per_pixel as usize / 8).max(1))
             .unwrap_or(1);
-        // Channel byte offsets for the color wire format, from the root visual's
-        // RGB masks (so we honour BGRX vs RGBX rather than guessing). Falls back
-        // to BGRX little-endian, the usual lab126 depth-24 layout.
+        // BGRX little-endian is the lab126 depth-24 fallback layout.
         let chan = wire_channels(&conn, &screen, bytes_per_pixel).unwrap_or([2, 1, 0]);
-        // stderr → steb.sh’s log: confirms geometry + the format we picked.
+        // stderr, which `Steb.sh` appends to its log.
         eprintln!(
             "fb: xres={xres} yres={yres} depth={depth} bytes_per_pixel={bytes_per_pixel} \
              chan=[{},{},{}] root_visual=0x{:x}",
@@ -177,30 +135,14 @@ impl Framebuffer {
             0,
             WindowClass::INPUT_OUTPUT,
             screen.root_visual,
-            // No `backing_store`. Asking for it costs panel updates on this
-            // hardware: with backing store the server can satisfy our drawing
-            // out of off-screen storage and propagate only some of it to the
-            // controller, so pixels are in the framebuffer and correct while the
-            // panel never refreshes them. That reads as content drawn,
-            // hit-testable, and invisible — a strip that responds to taps it
-            // doesn't display, a toast that won't clear, a repaint that appears
-            // an interaction late.
-            //
-            // Isolated by controlled comparison on a Scribe (`--probe-x`): two
-            // windows, identical paints and timing, differing only in this flag.
-            // Without it, 24 test squares landed every time; with it, squares
-            // went missing and others drew half. A framebuffer readback showed
-            // memory correct in both cases, which places the loss after X
-            // entirely — so this is the server's choice about what to send
-            // onward, not ours about what to draw.
+            // No `backing_store`: it costs panel refreshes on this hardware.
             &CreateWindowAux::new()
                 .background_pixel(screen.white_pixel)
                 .event_mask(EventMask::EXPOSURE),
         )
         .context("create_window")?;
 
-        // The lab126 WM reads the window name as a layout spec: Application
-        // layer, no chrome, fullscreen (the booklet/KUAL shape).
+        // The lab126 WM reads `WM_NAME` as a layout spec.
         let name = b"L:A_N:application_ID:com.steb.picker_PC:N_O:U";
         conn.change_property8(
             PropMode::REPLACE,
@@ -218,12 +160,7 @@ impl Framebuffer {
             .context("create_gc")?;
         conn.flush().context("flush after map")?;
 
-        // What the WM actually gave us, versus what we asked for. Everything is
-        // drawn against the *root* dimensions above, so a window that came back
-        // smaller or offset silently clips whatever sits at the screen edges —
-        // which is exactly how a top search bar and a bottom strip go missing
-        // while the middle of the grid survives. Logged rather than corrected
-        // because the right correction depends on which way it differs.
+        // The granted geometry against the requested `xres` / `yres`.
         match conn
             .get_geometry(win)
             .map_err(|e| e.to_string())
@@ -244,19 +181,9 @@ impl Framebuffer {
             Err(e) => eprintln!("fb: could not read window geometry: {e}"),
         }
 
-        // Ask the connection, not the setup block. `setup().maximum_request_length`
-        // is the *pre-negotiation* limit (65535 units = ~256 KB); x11rb enables
-        // BIG-REQUESTS during connect, and `maximum_request_bytes()` reports the
-        // ~16 MB limit that actually applies. A whole 1860×2480 frame is 4.6 MB,
-        // so a paint is one request.
-        //
-        // Uncapped on purpose. Splitting a paint into bands hands the server
-        // several damage regions instead of one, and since what actually goes
-        // missing on this hardware is a *panel refresh* rather than a request
-        // (measured: framebuffer memory was correct even when the screen wasn't),
-        // more regions is more to lose. Measurement also puts the single request
-        // at least as fast as the alternatives — 17.7 ms against 27.3 ms for
-        // eighteen bands — so there is nothing to trade off.
+        // `maximum_request_bytes` is the post-BIG-REQUESTS limit (~16 MB), past
+        // `setup().maximum_request_length`. A 1860×2480 frame is 4.6 MB: one
+        // request, uncapped.
         let max_req_bytes = conn.maximum_request_bytes().max(4096);
         eprintln!(
             "fb: max request {} bytes ({} rows/band at {} bpp)",
@@ -280,15 +207,13 @@ impl Framebuffer {
         })
     }
 
-    /// Single gray-pixel write in screen coords (0=black, 255=white), stored as
-    /// `(v,v,v)`. Out-of-range silently no-ops.
+    /// A gray pixel (0=black, 255=white) stored as `(v,v,v)`. Out-of-range no-ops.
     #[inline]
     pub fn put_pixel(&mut self, x: i32, y: i32, value: u8) {
         self.put_pixel_rgb(x, y, [value, value, value]);
     }
 
-    /// Single color-pixel write in screen coords, `[r, g, b]`. Used for cover
-    /// art; the chrome uses [`put_pixel`](Self::put_pixel). Out-of-range no-ops.
+    /// An `[r, g, b]` pixel, for cover art. Out-of-range no-ops.
     #[inline]
     pub fn put_pixel_rgb(&mut self, x: i32, y: i32, rgb: [u8; 3]) {
         if x < 0 || y < 0 || x >= self.var.xres as i32 || y >= self.var.yres as i32 {
@@ -300,9 +225,7 @@ impl Framebuffer {
         }
     }
 
-    /// Fill a rectangle with gray `value` (0=black, 255=white). A gray fill is
-    /// `(v,v,v)`, so every backing byte in the span is `value` — a single memset
-    /// over the `CH`-wide range stays correct and fast.
+    /// A rectangle of gray `value`: every backing byte in the span is `value`.
     pub fn fill_rect(&mut self, top: u32, left: u32, width: u32, height: u32, value: u8) {
         if left >= self.var.xres {
             return;
@@ -320,33 +243,15 @@ impl Framebuffer {
         }
     }
 
-    /// Drain the X event queue, reporting whether the server asked us to redraw.
-    ///
-    /// Two distinct problems live in this queue.
-    ///
-    /// **Exposures.** We select `EXPOSURE` when creating the window; leaving the
-    /// queue unread leaves that damage unrepaired, and the framework paints over
-    /// our window as it hands off. We do not ask for
-    /// backing store (see `open` for why that request is actively harmful here),
-    /// so repairing damage is our job and this is how we learn of it.
-    ///
-    /// **Errors.** `put_image` returns a `VoidCookie`, so a rejected request is
-    /// reported *asynchronously here*, not at the call site — `?` on the send
-    /// cannot see it. An unread queue therefore turns a failed screen update into
-    /// silence, which is indistinguishable from a display that simply didn't
-    /// refresh. Logging them is what makes that difference observable at all.
-    ///
-    /// Drains rather than peeks: a burst during handoff should cost one repaint,
-    /// not one per event.
+    /// Drains the X event queue, returning whether the server asked for a redraw.
+    /// `EXPOSURE` events and `put_image` errors both arrive here.
     pub fn pump_events(&mut self) -> bool {
         let mut needs_repaint = false;
         while let Ok(Some(event)) = self.conn.poll_for_event() {
             match event {
                 Event::Expose(_) => needs_repaint = true,
                 Event::Error(e) => {
-                    // A dropped update leaves the panel stale, so treat it as
-                    // damage too — retrying costs one repaint and may well
-                    // succeed, where doing nothing certainly stays wrong.
+                    // An error counts as damage: the panel holds a stale frame.
                     eprintln!("x11: WARNING request failed: {e:?}");
                     needs_repaint = true;
                 }
@@ -356,14 +261,8 @@ impl Framebuffer {
         needs_repaint
     }
 
-    /// Present the dirty rows, converting the RGB backing to the wire pixel
-    /// format per band. Depth-8 collapses each pixel to a luma byte; depth-24/32
-    /// places R/G/B at the visual's channel offsets with the remaining byte left
-    /// 0xFF (opaque pad). Each wire scanline is a whole number of pixels and
-    /// `xres` (1264) keeps both widths (×1 and ×4) 4-byte aligned, so ZPixmap's
-    /// 32-bit scanline padding needs no extra slack. Chunked under the server's
-    /// max request length. Identity (the X server rotates the window); waveform
-    /// ignored.
+    /// Presents the rows of `rect`, converting the backing to the wire pixel
+    /// format per band. `waveform` is ignored.
     pub fn send_update(&mut self, rect: MxcfbRect, _waveform: u32) -> Result<u32> {
         let bpp = self.bytes_per_pixel;
         let xres = self.var.xres as usize;
@@ -375,8 +274,7 @@ impl Framebuffer {
         let max_rows = (self.max_req_bytes.saturating_sub(64) / wire_stride.max(1)).max(1);
         let [rb, gb, bb] = self.chan;
 
-        // Scratch reused across bands: the backing RGB converted to the wire
-        // pixel format. Pad bytes (depth-24/32) stay at the 0xFF fill.
+        // Reused across bands. Pad bytes stay at the 0xFF fill.
         let mut wire: Vec<u8> = Vec::new();
 
         let mut y = top;
@@ -389,11 +287,10 @@ impl Framebuffer {
 
             wire.clear();
             wire.resize(px * bpp, 0xFF);
-            // Walk source RGB triples against destination wire pixels in
-            // lockstep. depth-8 (`bpp == 1`) collapses to one luma byte;
-            // depth-24/32 scatters R/G/B to the visual's channel offsets, the
-            // remaining byte left at the 0xFF pad.
-            let pairs = wire.chunks_exact_mut(bpp).zip(band.chunks_exact(CH));
+            // `bpp == 1` collapses to one luma byte; wider scatters R/G/B to
+            // [`Framebuffer::chan`].
+            let (triples, _) = band.as_chunks::<CH>();
+            let pairs = wire.chunks_exact_mut(bpp).zip(triples);
             if bpp == 1 {
                 for (w, src) in pairs {
                     w[0] = luma(src[0], src[1], src[2]);
@@ -422,17 +319,8 @@ impl Framebuffer {
                 .context("put_image")?;
             y += h as u32;
         }
-        // Round-trip, not a bare flush. `flush` only guarantees the bytes left
-        // this process; it says nothing about the server having consumed them,
-        // and the panel refresh rides on the server actually processing the
-        // batch. Without a reply to wait for, a paint could sit unprocessed
-        // until the *next* request arrived — which is precisely the "repaint is
-        // one tap behind" behaviour, and why chrome drawn in the same pass as
-        // the grid could still show up later than it.
-        //
-        // It earns a second keep: a reply forces the server to have dealt with
-        // every preceding request, so any error they raised is delivered now
-        // rather than sitting unnoticed on the event queue.
+        // A round-trip, past `flush`: the reply marks the batch processed and
+        // delivers any error it raised.
         self.conn
             .get_input_focus()
             .context("sync round-trip")?
@@ -441,30 +329,20 @@ impl Framebuffer {
         Ok(0)
     }
 
-    /// Clone the backing buffer — the exact packed-RGB image currently on
-    /// screen. Used to save a screenshot and to restore the screen after the
-    /// capture flash overwrites it.
+    /// A clone of the backing buffer.
     pub fn backing_snapshot(&self) -> Vec<u8> {
         self.backing.clone()
     }
 
-    /// Restore a previously snapshotted backing buffer. No-op on a size
-    /// mismatch (a rotation between snapshot and restore would change `xres`).
-    /// The caller still has to `send_update` to present it.
+    /// A [`Framebuffer::snapshot`] back into the backing. A size mismatch no-ops.
+    /// [`Framebuffer::send_update`] presents it.
     pub fn restore_backing(&mut self, snap: Vec<u8>) {
         if snap.len() == self.backing.len() {
             self.backing = snap;
         }
     }
 
-    /// Encode the current backing (packed RGB, white=255) as a PNG at `path`.
-    /// No rotation: the backing is the upright UI as rendered — we draw identity
-    /// and the lab126 compositor rotates the *display* to the grip, so the
-    /// encoded file already matches what the user saw in either orientation.
-    /// (Pre-X11 we rotated raw `/dev/fb0` writes ourselves and undid that here;
-    /// the pre-rotation is gone, so undoing it now would flip the file upside
-    /// down — that was the screenshot-bug.) The `png` encoder ships with the
-    /// `image` dep (pure Rust).
+    /// The backing encoded as a PNG at `path`, unrotated.
     pub fn capture_png(&self, path: &Path) -> Result<()> {
         let img = image::RgbImage::from_raw(self.var.xres, self.var.yres, self.backing.clone())
             .context("backing buffer size != xres*yres*CH")?;
@@ -476,8 +354,7 @@ impl Framebuffer {
 
 impl Drop for Framebuffer {
     fn drop(&mut self) {
-        // Destroy the window so the WM recomposites the screen underneath (home
-        // library + status bar repaint). Best effort — Drop can't propagate.
+        // The WM recomposites the screen under a destroyed window.
         let _ = self.conn.destroy_window(self.win);
         let _ = self.conn.flush();
     }

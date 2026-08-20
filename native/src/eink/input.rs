@@ -1,15 +1,6 @@
-//! Input multiplexer: wait on the touchscreen and the bezel page-button device
-//! at once via `poll(2)`, surfacing a unified event so the main loop handles
-//! both without threads or channels.
-//!
-//! Why poll rather than two read loops: the main loop can only block in one
-//! place, and it must wake for *either* device. `poll(2)` blocks until one fd
-//! is readable, then we drain the ready one without blocking on the other.
-//! `Buttons::read_one` reads exactly one record (poll already guaranteed it's
-//! present). `Touch::next_event` is non-blocking (its fd is `O_NONBLOCK`): it
-//! drains the currently-available events and returns `None` if they don't
-//! complete a Down/Up boundary, in which case we re-poll — so a touch stroke
-//! mid-flight can't block the loop and starve the button fd.
+//! `poll(2)` over the touchscreen and the bezel page-button device at once,
+//! surfacing one [`InputEvent`]. The ready fd drains without blocking on the
+//! other; `Touch::next_event` answers `None` short of a boundary and re-polls.
 
 use std::os::fd::RawFd;
 use std::time::Instant;
@@ -20,9 +11,9 @@ use super::buttons::{Buttons, PageButton};
 use super::touch::{Touch, TouchEvent};
 use crate::orientation::Orientation;
 
-/// How long `next` blocks before surfacing a `Tick`. Bounds how quickly the
-/// main loop notices a device rotation (it re-reads the framework orientation
-/// on each `Tick`); only fires when idle, since real input returns first.
+/// How long [`Input::next`] blocks before surfacing a `Tick`, bounding how
+/// quickly a device rotation reaches the main loop. Fires on an idle poll:
+/// real input returns first.
 const TICK_MS: libc::c_int = 500;
 
 /// A unified input event from either device.
@@ -30,9 +21,8 @@ const TICK_MS: libc::c_int = 500;
 pub enum InputEvent {
     Touch(TouchEvent),
     Page(PageButton),
-    /// Poll timed out with no input. The main loop re-checks the framework
-    /// orientation on this and repaints + re-orients touch/buttons if it
-    /// changed (the X server rotates the display; raw evdev coords don't).
+    /// `poll` timed out with no input. The main loop re-checks orientation
+    /// here: the X server rotates the display, raw evdev coords stay fixed.
     Tick,
 }
 
@@ -57,20 +47,14 @@ impl Input {
         }
     }
 
-    /// Latest primary touch position, user-visible coords (see
-    /// [`Touch::current_pos`]). Read at the arm deadline for the long-press slop
-    /// guard — a hold that has drifted off its landing point is a drag, not a hold.
+    /// Latest primary touch position in user-visible coords, read at the arm
+    /// deadline against `crate::ARM_SLOP_PX`.
     pub fn touch_pos(&self) -> (u32, u32) {
         self.touch.current_pos()
     }
 
-    /// Non-blocking check for a pending event (zero-timeout `poll`). Returns
-    /// the first ready event, or `None` if neither device has a complete event
-    /// right now. Unlike [`next`](Self::next) it never blocks and never
-    /// surfaces `Tick` — the blocking flows (download, decrypt) call it
-    /// between their blocking steps to notice a Cancel tap, bezel press, or
-    /// screenshot gesture without stalling the work. A partial touch stroke
-    /// reads as `None` and is caught on a later call.
+    /// A zero-timeout `poll`: the first ready event, or `None`. Surfaces no
+    /// `Tick`, and a partial touch stroke reads as `None`.
     pub fn poll_now(&mut self) -> Result<Option<InputEvent>> {
         let touch_fd: RawFd = self.touch.raw_fd();
         let button_fd: RawFd = self.buttons.as_ref().map(|b| b.raw_fd()).unwrap_or(-1);
@@ -87,17 +71,12 @@ impl Input {
             },
         ];
         let nfds: libc::nfds_t = if self.buttons.is_some() { 2 } else { 1 };
-        // Zero timeout → return immediately. A negative rc (EINTR/error) is
-        // treated as "no input this tick"; the caller polls again next chunk.
+        // A negative rc (EINTR, error) reads as no input this tick.
         if unsafe { libc::poll(fds.as_mut_ptr(), nfds, 0) } <= 0 {
             return Ok(None);
         }
-        // Touch first, unlike `next` (which prioritizes bezel presses for
-        // navigation). The callers are blocking flows (download, decrypt),
-        // where the touch fd carries both the Cancel button and the two-corner
-        // screenshot gesture. Checking buttons first would let a stale/None
-        // button read return early and *shadow* a pending touch event,
-        // stalling the gesture until the main loop resumes.
+        // Touch first, past [`Input::next`]'s order: a stale `None` button read
+        // returns early and shadows a pending touch event.
         if fds[0].revents & libc::POLLIN != 0
             && let Some(ev) = self.touch.next_event()?
         {
@@ -119,30 +98,13 @@ impl Input {
         self.next_deadline(None)
     }
 
-    /// Like [`Self::next`], but when `deadline` is `Some`, surfaces an
-    /// [`InputEvent::Tick`] the instant that time is reached — even while the
-    /// touch fd stays busy.
-    ///
-    /// This is the wake the long-press arm-flip relies on. While a finger is
-    /// held, the panel emits near-continuous micro-jitter move events, so a poll
-    /// that re-armed a fixed [`TICK_MS`] on every move-drain would never idle out
-    /// and the loop could not wake mid-hold to flip the tile and auto-fire. Here
-    /// the timeout is the *remaining* time to the absolute `deadline` (recomputed
-    /// each iteration, never reset by a move-drain), and a top-of-loop check
-    /// returns `Tick` once we're at/past it regardless of pending moves. With
-    /// `deadline == None` this is the original behaviour: a plain [`TICK_MS`]
-    /// idle tick.
-    ///
-    /// Button presses are checked first each wake: a press is a deliberate
-    /// navigation intent, and draining it promptly keeps the grabbed device's
-    /// queue short. On touch readiness we drain `Touch::next_event`
-    /// non-blocking; if it returns `None` (no boundary in the available data)
-    /// we re-poll rather than block, keeping the button fd serviced.
+    /// [`Self::next`] with an [`InputEvent::Tick`] at `deadline`, past a busy
+    /// touch fd: the timeout is the remaining time to the absolute `deadline`,
+    /// recomputed each iteration. `None` gives a plain [`TICK_MS`] idle tick.
     pub fn next_deadline(&mut self, deadline: Option<Instant>) -> Result<InputEvent> {
         let touch_fd: RawFd = self.touch.raw_fd();
         loop {
-            // At/past the deadline: surface the wake now, even if move-jitter kept
-            // `poll` busy right up to it (a fixed TICK_MS reset can't guarantee this).
+            // At or past `deadline`, through move-jitter that kept `poll` busy.
             if let Some(d) = deadline
                 && Instant::now() >= d
             {
@@ -163,9 +125,8 @@ impl Input {
             ];
             let nfds: libc::nfds_t = if self.buttons.is_some() { 2 } else { 1 };
 
-            // Remaining time to the deadline (≥1ms so a sub-ms remainder can't
-            // spin), else the idle TICK_MS. poll still wakes early on fd
-            // readiness; the timeout only bounds the idle wake.
+            // Remaining time to `deadline`, floored at 1ms against a sub-ms
+            // spin, else [`TICK_MS`]. `poll` wakes early on fd readiness.
             let timeout = match deadline {
                 Some(d) => (d
                     .saturating_duration_since(Instant::now())
@@ -185,20 +146,17 @@ impl Input {
             if rc == 0 {
                 return Ok(InputEvent::Tick); // deadline reached, or idle timeout.
             }
-            // The deadline passed while poll was blocked and an event happened to
-            // arrive in the same wake: the arm wins over the event (which stays
-            // queued and surfaces next call). This closes the ~1ms race where a
-            // finger lifting right at the threshold would otherwise return `Up`
-            // before the arm `Tick`, so the caller only ever fires from one path.
+            // `deadline` passed while `poll` blocked, with an event in the same
+            // wake: the arm wins and the event surfaces next call. A finger
+            // lifting on the threshold returns `Tick`, never `Up`.
             if let Some(d) = deadline
                 && Instant::now() >= d
             {
                 return Ok(InputEvent::Tick);
             }
 
-            // Buttons first. `read_one` returns None for releases / autorepeat
-            // / SYN / unmapped keys, in which case we loop and poll again
-            // rather than block on a second read.
+            // Buttons first. `read_one` answers `None` on a release, autorepeat,
+            // SYN or unmapped key, which re-polls.
             if let Some(buttons) = self.buttons.as_mut()
                 && fds[1].revents & libc::POLLIN != 0
             {
@@ -209,11 +167,9 @@ impl Input {
             }
 
             if fds[0].revents & libc::POLLIN != 0 {
-                // Drain non-blocking. `next_event` returns None when the
-                // available bytes don't complete a Down/Up boundary (a
-                // move-only or partial packet) — re-poll rather than block in
-                // the touch read, so a concurrent bezel-button press isn't
-                // starved. This is why touch is opened O_NONBLOCK.
+                // `next_event` answers `None` short of a Down/Up boundary — a
+                // move-only or partial packet — and re-polls. Touch is opened
+                // `O_NONBLOCK` for this.
                 if let Some(ev) = self.touch.next_event()? {
                     return Ok(InputEvent::Touch(ev));
                 }

@@ -1,13 +1,6 @@
-//! The native Kindle two-corner screenshot gesture, reimplemented for Steb.
-//!
-//! On stock firmware a simultaneous opposite-corner tap captures the screen to
-//! a PNG. That recognizer never fires under Steb: we hold an exclusive
-//! `EVIOCGRAB` on the touchscreen (see [`super::touch`]), so the framework —
-//! recognizer included — sees no touch events while we're foreground. So we
-//! recognize the gesture ourselves in `touch.rs` (it has the multi-touch state
-//! and the screen dimensions) and capture here. The capture itself is cheap:
-//! `Framebuffer`'s backing buffer already holds exactly what's on screen, so a
-//! screenshot is just encoding it (plus a white flash for the "got it" cue).
+//! The Kindle two-corner screenshot gesture, recognized in [`super::touch`] and
+//! captured here: an exclusive `EVIOCGRAB` starves the stock recognizer.
+//! `Framebuffer`'s backing holds the screen, leaving an encode and a flash.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -20,19 +13,13 @@ use super::fb::{Framebuffer, MxcfbRect, WAVEFORM_MODE_GC16};
 /// so they show up where expected when the Kindle is plugged in over USB.
 const SCREENSHOT_DIR: &str = "/mnt/us/screenshots";
 
-/// Hold the white flash long enough to read as a deliberate flash rather than
+/// Holds the white flash long enough to read as deliberate, past
 /// a refresh glitch, short enough not to feel like a hang.
 const FLASH_MS: u64 = 120;
 
-/// Save the current screen to a timestamped PNG, flash white as feedback, then
-/// restore the screen. Returns the written path. No rotation is applied: the
-/// backing already holds the upright UI (we render identity and the compositor
-/// rotates the *display* to the grip), so the file matches what the user saw in
-/// either orientation — see [`Framebuffer::capture_png`].
-///
-/// Best-effort by construction: the white flash and restore run regardless of
-/// whether the encode succeeded, so a write failure never leaves the screen
-/// blanked. Callers log the result but should not treat an `Err` as fatal.
+/// The screen to a timestamped PNG, a white flash, then the screen restored.
+/// Returns the written path, unrotated — see [`Framebuffer::capture_png`]. The
+/// flash and restore run past a failed encode.
 pub fn capture(fb: &mut Framebuffer) -> Result<PathBuf> {
     let dir = Path::new(SCREENSHOT_DIR);
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
@@ -42,8 +29,8 @@ pub fn capture(fb: &mut Framebuffer) -> Result<PathBuf> {
         .unwrap_or(0);
     let path = dir.join(format!("screenshot_{secs}.png"));
 
-    // Snapshot before anything touches the backing: `capture_png` reads the
-    // live screen, and we restore this exact buffer after the flash.
+    // Taken before anything touches the backing: `capture_png` reads the live
+    // screen, and this exact buffer restores after the flash.
     let snap = fb.backing_snapshot();
     let cap = fb.capture_png(&path);
 

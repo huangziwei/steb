@@ -1,12 +1,6 @@
-//! Parse a book's own page for the two files we want.
-//!
-//! Fetched only when the user taps a cell — a listing gives us everything
-//! needed to *draw* a book, and nothing here is worth a request until someone
-//! actually wants the file.
-//!
-//! Both hrefs are read from the page rather than constructed. The download slug
-//! gains segments for translators and editors (`homer_the-iliad_alexander-pope.azw3`),
-//! so `{author}_{title}.azw3` 404s across a large minority of the catalogue.
+//! A book's page, parsed for its `.azw3` and cover thumbnail hrefs.
+//! Both are read from the markup: a [`DownloadHref`] carries translator and
+//! editor segments (`homer_the-iliad_alexander-pope.azw3`).
 
 use super::url::{BadUrl, DownloadHref, ThumbnailHref};
 
@@ -19,8 +13,7 @@ pub struct BookPage {
 
 #[derive(Debug)]
 pub enum ParseError {
-    /// No `class="amazon"` link. SE produces an azw3 for every book, so this
-    /// means the page shape changed — not that this book lacks a Kindle build.
+    /// No `class="amazon"` link in the markup.
     NoAzw3,
     Url(BadUrl),
 }
@@ -49,9 +42,7 @@ fn href_of_anchor_containing(html: &str, marker: &str) -> Option<String> {
 }
 
 pub fn parse(html: &str) -> Result<BookPage, ParseError> {
-    // `class="amazon"` is SE's own marker for the Kindle build and is
-    // unambiguous — the epub, kepub and advanced-epub links carry different
-    // classes, so there is no need to disambiguate on the extension too.
+    // `class="amazon"` marks the Kindle build alone.
     let azw3 = href_of_anchor_containing(html, "class=\"amazon\"")
         .ok_or(ParseError::NoAzw3)
         .and_then(|h| DownloadHref::parse(&h).map_err(ParseError::Url))?;
@@ -64,8 +55,7 @@ pub fn parse(html: &str) -> Result<BookPage, ParseError> {
         .trim()
         .to_string();
 
-    // Best-effort: a missing thumbnail costs a home-screen cover, never the
-    // download itself.
+    // `None` where the page carries no `_EBOK_portrait.jpg`.
     let thumbnail = html
         .find("_EBOK_portrait.jpg")
         .and_then(|at| {
@@ -98,8 +88,6 @@ mod tests {
     #[test]
     fn finds_the_kindle_thumbnail() {
         let thumb = parse(DRACULA).unwrap().thumbnail.expect("thumbnail link");
-        // The id in the filename is the azw3's ASIN, which is what makes
-        // dropping this into system/thumbnails/ work.
         assert_eq!(
             thumb.file_name(),
             "thumbnail_164eb70ff819bc597b5498008b4d7b86ae66df93_EBOK_portrait.jpg"

@@ -1,21 +1,6 @@
-//! Live checks against standardebooks.org.
-//!
-//! **All `#[ignore]` by default.** Steb's whole design is about not burdening
-//! someone else's server, and a test suite that hits the live site on every
-//! `cargo test` would make us exactly the thing we are trying not to be. Run
-//! deliberately:
-//!
-//! ```sh
-//! cargo test -p steb-native --test live -- --ignored --test-threads=1
-//! ```
-//!
-//! What these cover that the fixture tests cannot: that the TLS stack actually
-//! negotiates with the real server. Steb uses the RustCrypto crypto provider
-//! rather than `ring` — a build-driven choice (see `native/Cargo.toml`) — and
-//! nothing offline can tell us whether that provider and SE's TLS 1.3
-//! configuration agree. Everything else here is a canary for markup drift:
-//! these run against today's site, so a failure means SE changed, not that the
-//! parser was always wrong.
+//! Live checks against standardebooks.org, every one `#[ignore]`. Run them
+//! with `cargo test -p steb-native --test live -- --ignored
+//! --test-threads=1`.
 
 use steb_native::se::url::{Endpoint, Listing};
 use steb_native::se::{book, feed, http, listing};
@@ -27,8 +12,6 @@ fn client() -> http::Client {
 #[test]
 #[ignore = "hits standardebooks.org"]
 fn tls_handshake_succeeds_with_the_rustcrypto_provider() {
-    // The one thing no fixture can answer. If this fails, the device build is
-    // dead on arrival regardless of how good the parsers are.
     let page = client()
         .text(&Endpoint::Listing(Listing::default()))
         .expect("TLS handshake + GET /ebooks");
@@ -47,10 +30,7 @@ fn the_opening_screen_still_parses() {
     let page = listing::parse(&html).expect("parse listing");
 
     assert!(!page.hits.is_empty(), "bare /ebooks should list books");
-    // We request per-page=48, so the catalogue is roughly 30-odd pages, not the
-    // ~125 a browser shows at its 12-per-page default. The bounds below are set
-    // against our page size, not the browser's, so a `total_pages` that has
-    // latched onto `per-page=` instead of `page=` fails here.
+    // The bounds below are set against `per-page=48`.
     assert!(
         page.total_pages > 10,
         "expected a multi-page catalogue, got {} pages",
@@ -99,9 +79,7 @@ fn a_book_page_still_yields_an_azw3() {
 #[test]
 #[ignore = "hits standardebooks.org"]
 fn the_feed_answers_a_conditional_request_with_304() {
-    // The single most important politeness property: a launch with nothing new
-    // must transfer no body. If SE ever stops sending validators this silently
-    // becomes a full fetch every launch, so it is worth pinning.
+    // A conditional request carrying a validator answers 304 with no body.
     let c = client();
     let first = c
         .text_if_modified(&Endpoint::Feed, &http::Validators::default())

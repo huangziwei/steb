@@ -1,15 +1,6 @@
-//! Bottom-strip toolbar.
-//!
-//! Always-visible 80px strip at the bottom of the panel with tap zones,
-//! left-to-right:
-//!
-//! - `Exit` — always shown, fixed-width left zone.
-//! - `Filter` — always shown, fixed-width zone; opens the subject checklist,
-//!   shows `(N)` when N subjects are selected.
-//! - `Sort` — always shown, fixed-width zone; opens the sort picker.
-//! - `← Prev / N / Next →` — the remaining width, split in half: left half pages
-//!   back, right half pages forward (shown only when n_pages > 1). Touch nav is
-//!   the only paging on a device with no bezel buttons.
+//! Bottom-strip toolbar: an 80px strip of tap zones, left to right `Exit`,
+//! `Filter` (carrying `(N)` selected subjects), `Sort`, then `← Prev / N /
+//! Next →` over the remaining width under an `n_pages` past 1.
 
 use crate::eink::fb::Framebuffer;
 use crate::ui::text::TextRenderer;
@@ -33,8 +24,7 @@ pub enum PagerHit {
     Filter,
     /// Opens the sort picker.
     Sort,
-    /// Page back / forward — the nav region's left / right half (see `hit`).
-    /// Touch nav is the only paging on the Paperwhite (no bezel buttons).
+    /// Page back or forward: the nav region's left or right half, from [`hit`].
     Prev,
     Next,
 }

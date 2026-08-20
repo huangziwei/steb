@@ -1,18 +1,6 @@
-//! `--probe-x`: dump everything that could explain why one panel refreshes and
-//! another does not, in a form two devices can be diffed against each other.
-//!
-//! The renderer assumes the X server turns damage into an eink refresh by
-//! itself, so the caller need not ask for one. Where that does not hold,
-//! drawing is correct and the screen is still stale, and no adjustment to *how*
-//! pixels are uploaded reaches it.
-//!
-//! So the questions here are deliberately about the mechanism, not our usage:
-//! which extensions the server offers (an eink/refresh extension being the thing
-//! we would otherwise never think to call), what the real request limits are,
-//! whether a full-screen upload succeeds and how long the server takes to
-//! acknowledge it, and whether the classic framebuffer refresh paths still exist
-//! underneath. Run it on a device that works and on one that doesn't; the diff is
-//! the answer.
+//! `--probe-x`: what could explain one panel refreshing and another not, in a
+//! form two devices diff against each other. The probes ask after the
+//! mechanism `crate::eink::fb` takes the X server for.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -26,8 +14,7 @@ use x11rb::protocol::xproto::{
 };
 use x11rb::wrapper::ConnectionExt as _;
 
-/// Where the dump lands — on the user partition, so it is reachable over USB or
-/// MTP without a shell.
+/// Where the dump lands: the user partition, reachable over USB or MTP.
 const OUT_PATH: &str = "/mnt/us/steb-xprobe.txt";
 
 pub fn run() -> Result<()> {
@@ -121,8 +108,7 @@ fn probe_x(o: &mut String) {
         }
     }
 
-    // The list we most want to compare. A lab126/eink-specific extension here is
-    // the refresh mechanism we would otherwise never call.
+    // A lab126 or eink-specific extension here names the refresh mechanism.
     let _ = writeln!(o, "\n[extensions]");
     match conn
         .list_extensions()
@@ -148,13 +134,9 @@ fn probe_x(o: &mut String) {
     probe_paint(&conn, &screen, o);
 }
 
-/// Actually paint, the way the renderer does, and time the server's
-/// acknowledgement.
-///
-/// Reports each band separately so a partial failure is visible as a partial
-/// failure rather than as "the screen looked wrong". The round-trip after each
-/// band is what converts an asynchronous protocol error into a value we can
-/// print next to the band that caused it.
+/// A paint the way `crate::eink::fb` does it, timing the server's
+/// acknowledgement. Each band reports separately, its round-trip turning an
+/// asynchronous protocol error into a value printed beside it.
 fn probe_paint(conn: &impl Connection, screen: &x11rb::protocol::xproto::Screen, o: &mut String) {
     let _ = writeln!(o, "\n[paint test]");
     let xres = screen.width_in_pixels as usize;
@@ -295,20 +277,9 @@ fn probe_paint(conn: &impl Connection, screen: &x11rb::protocol::xproto::Screen,
     let _ = conn.flush();
 }
 
-/// Does a burst of small updates cancel a full-screen refresh that is still in
-/// flight?
-///
-/// This is the one thing the rest of the probe cannot answer, because it only
-/// ever paints when nothing else is. `repaint_page` does the opposite: a
-/// full-screen `GC16` — a full flash over 4.6M pixels, on the order of a second —
-/// and then, without waiting, twenty per-cover partial updates. If later updates
-/// supersede an in-flight one, the fast partials win, the full refresh is
-/// abandoned, and the panel keeps its previous frame everywhere except the cells
-/// that were painted individually. That is the reported behaviour exactly.
-///
-/// The test is visual because the outcome lives on the panel, not in the
-/// protocol: X will report success either way. Each phase says what it painted,
-/// and what you should see if the hypothesis is wrong.
+/// Does a burst of small updates cancel an in-flight full-screen refresh? A
+/// full-screen `GC16` over 4.6M pixels, then twenty partials without waiting.
+/// The outcome lives on the panel: X reports success either way.
 #[allow(clippy::too_many_arguments)]
 fn probe_supersession(
     conn: &impl Connection,
@@ -440,16 +411,9 @@ fn probe_supersession(
     }
 }
 
-/// Does `BackingStore::ALWAYS` stop paints from reaching the panel?
-///
-/// The probe's window and the renderer's are not created alike: the renderer
-/// asks for backing store. With `Composite` active, a server honouring that
-/// request may keep our pixels in off-screen storage and propagate them on its
-/// own schedule — content present and hit-testable, but not displayed until
-/// something later flushes it.
-///
-/// Two windows, same paints, one difference. Whichever one misbehaves names the
-/// cause.
+/// Does `BackingStore::ALWAYS` stop paints from reaching the panel? This window
+/// asks for it, which `crate::eink::fb` does not. Two windows, the same paints,
+/// one difference.
 fn probe_backing_store(o: &mut String) {
     let _ = writeln!(o, "\n[backing-store test]");
     let (conn, screen_num) = match x11rb::connect(None) {
@@ -535,8 +499,8 @@ fn probe_backing_store(o: &mut String) {
             );
         };
 
-        // Black, then white with squares — the same shape as the phase that
-        // already passed on a plain window, so any difference is the flag.
+        // Black, then white with squares: the shape the plain-window phase
+        // passed on, leaving the flag as the one difference.
         put(0x00, xres, yres, 0, 0);
         sync(&conn);
         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -571,26 +535,9 @@ fn probe_backing_store(o: &mut String) {
     }
 }
 
-/// Paint known squares, then read `/dev/fb0` back and measure what actually
-/// arrived.
-///
-/// "Some squares are missing, some are half" is the observation that matters,
-/// and it cannot be judged reliably by eye or recovered from the protocol — X
-/// reports every one of those uploads as successful. The framebuffer is the
-/// stage *after* X and before the panel, so reading it says which uploads
-/// reached panel memory and, more usefully, the exact geometry of whatever went
-/// wrong. Two candidate causes leave different fingerprints:
-///
-/// - **Stride.** The panel's line stride is 1872 while X calls the screen 1860
-///   wide. If anything writes rows at the wrong pitch, each successive row slips
-///   sideways by 12px and the damage is a shear — coverage falling off gradually
-///   down a square, and content displaced horizontally.
-/// - **Update-region limits.** An eink controller accepts a bounded number of
-///   concurrent update rectangles. Run out and whole squares vanish while
-///   partially-processed ones are cut across a row — coverage that is 100% or 0%
-///   per square, with a clean horizontal edge on the casualties.
-///
-/// The per-square coverage table below distinguishes them.
+/// Known squares painted, then `/dev/fb0` read back for what arrived: the stage
+/// after X and before the panel. The per-square coverage table separates a
+/// stride shear (1872 against X's 1860) from an update-region limit.
 fn probe_fb_readback(o: &mut String) {
     let _ = writeln!(o, "\n[framebuffer readback]");
 
@@ -673,7 +620,7 @@ fn probe_fb_readback(o: &mut String) {
             .and_then(|c| c.reply().map(|_| ()).map_err(|e| e.to_string()));
     };
 
-    // A white field, then squares on a grid whose positions we can check.
+    // A white field, then squares at checkable grid positions.
     const S: usize = 120;
     let squares: Vec<(usize, usize)> = (0..24)
         .map(|i| {
@@ -784,9 +731,8 @@ fn read_fb_page(offset: usize, len: usize) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-/// The pre-X refresh paths. If the X server does not drive the panel here, one
-/// of these is how it is driven instead, and their presence or absence is the
-/// difference worth knowing.
+/// The pre-X refresh paths, one of which drives the panel where the X server
+/// does not.
 fn probe_eink_paths(o: &mut String) {
     let _ = writeln!(o, "\n[eink control paths]");
     for p in [

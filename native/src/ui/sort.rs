@@ -1,22 +1,10 @@
-//! Which sort the user picked.
-//!
-//! Standard Ebooks sorts server-side, so this holds a choice and nothing else:
-//! there is no comparator here, and the choice reaches the server as a query
-//! parameter.
-//!
-//! There is no sort *direction* either. SE's options bake the direction into
-//! the option itself ("Author name (a → z)", "Length (short → long)"), so there
-//! is nothing to toggle.
+//! The chosen sort. SE sorts server-side and bakes direction into each option
+//! ("Author name (a → z)"), so this holds a choice: no comparator, no toggle.
 
 use crate::se::url::Sort;
 
-/// What the sort menu offers, in SE's own order.
-///
-/// [`None`] is *SE's default* rather than an absence of opinion, and it is
-/// deliberately first: it is what the app opens on, and picking it again is how
-/// the user gets back. Sending no `sort` parameter is what makes SE apply
-/// release-date-newest while browsing and relevance while searching — the right
-/// thing in each mode, without us having to know which mode we are in.
+/// The menu rows, in SE's own order. [`None`] leads: it sends no `sort`
+/// parameter, leaving SE's own default in either mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SortState(pub Option<Sort>);
 
@@ -32,7 +20,7 @@ impl SortState {
         SortState(Some(Sort::Popularity)),
     ];
 
-    /// SE's own wording, so the menu matches what the site says.
+    /// SE's own wording.
     pub fn label(self) -> &'static str {
         match self.0 {
             None => "Default",
@@ -45,10 +33,8 @@ impl SortState {
         }
     }
 
-    /// Whether this row is worth offering right now.
-    ///
-    /// SE only offers relevance when there is something to be relevant to, so
-    /// the row is hidden while browsing rather than shown and silently ignored.
+    /// Whether this row is offered under `has_query`. `Relevance` is
+    /// search-only.
     pub fn available(self, has_query: bool) -> bool {
         has_query || self.0 != Some(Sort::Relevance)
     }
@@ -77,7 +63,7 @@ mod tests {
         let relevance = SortState(Some(Sort::Relevance));
         assert!(!relevance.available(false));
         assert!(relevance.available(true));
-        // Everything else is always offered.
+        // Every other row is unconditional.
         for s in SortState::ALL.iter().filter(|s| **s != relevance) {
             assert!(s.available(false), "{} should always be offered", s.label());
         }

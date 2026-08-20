@@ -1,22 +1,7 @@
 #!/bin/sh
-# Regenerate the home-screen tile's cover art (documents/Steb.sh).
-#
-# A `documents/*.sh` scriptlet is indexed as a library tile, and the framework
-# draws whatever PNG its `# Icon:` header carries as a base64 data URI. That
-# header is one ~21KB line, so it is generated rather than hand-edited.
-#
-# Pipeline: assets/cover.svg -> render -> shrink -> assets/cover.png -> base64
-# -> the `# Icon:` line. Each step takes the first tool it finds — rsvg-convert
-# or resvg to render, pngquant or oxipng to shrink — so a machine with only the
-# Rust toolchain (`cargo install resvg oxipng`) can still regenerate the tile.
-# Every tool is optional; without a renderer the committed PNG is reused, and
-# the script says which step it skipped.
-#
-# This rewrites ONLY the `# Icon:` line. The shebang, the other headers and the
-# script body are left untouched, so the scriptlet stays a normal file you can
-# edit by hand — run this after changing the cover, not after changing the body.
-#
-# Usage: device/make-tile.sh
+# device/make-tile.sh — regenerate the `# Icon:` line of documents/Steb.sh, one
+# ~21KB base64 PNG. Pipeline: assets/cover.svg -> render -> shrink ->
+# assets/cover.png -> base64. Every tool is optional; only that line is rewritten.
 set -eu
 
 cd "$(dirname "$0")"
@@ -25,7 +10,7 @@ SVG="assets/cover.svg"
 PNG="assets/cover.png"
 TILE="documents/Steb.sh"
 
-# Kindle library-tile cover, matching the committed PNG. Other dimensions still
+# Kindle library-tile cover, matching the committed PNG. Other dimensions
 # render, just blurry or letterboxed in the home grid.
 WIDTH=1440
 HEIGHT=2200
@@ -49,11 +34,9 @@ if [ -f "$SVG" ] && [ -n "$RENDERER" ]; then
     else
         resvg -w "$WIDTH" -h "$HEIGHT" "$SVG" "$PNG"
     fi
-    # Shrink to an 8-bit palette. The tile ships inline as base64 inside a file
-    # pushed over USB, so a smaller PNG is a smaller scriptlet. pngquant
-    # palettizes lossily; oxipng does it losslessly, which is enough here
-    # because the flat two-colour art plus its antialiasing stays well under
-    # the 256 colours a palette holds.
+    # Shrink to an 8-bit palette: a smaller PNG is a smaller scriptlet.
+    # pngquant palettizes lossily, oxipng losslessly. The flat two-colour art
+    # and its antialiasing sit well under the 256 colours a palette holds.
     if command -v pngquant >/dev/null 2>&1; then
         pngquant --force --skip-if-larger --output "$PNG" -- "$PNG"
     elif command -v oxipng >/dev/null 2>&1; then
@@ -72,7 +55,7 @@ fi
 [ -f "$PNG" ] || { echo "error: no $PNG to embed" >&2; exit 1; }
 
 # `base64` differs across platforms: BSD/macOS emits one line, GNU wraps at 76
-# columns unless given -w0. A wrapped icon would break the single-line header,
+# columns unless given -w0. A wrapped icon breaks the single-line header,
 # so strip newlines either way.
 ICON="$(base64 < "$PNG" | tr -d '\n')"
 

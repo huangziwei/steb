@@ -1,23 +1,6 @@
-//! The catalogue cache — book records that survive a monthly update.
-//!
-//! We are scraping someone else's server for free, so the design goal is that a
-//! launch with nothing new costs one conditional request and no listing fetch
-//! at all.
-//!
-//! **The key is a book, never a page number.** Standard Ebooks orders by
-//! release date newest-first, so publishing N new books shifts every page
-//! boundary — page 3 today is not page 3 next month. A page-keyed cache would
-//! therefore self-destruct on exactly the monthly event it needs to survive.
-//! Keyed by the book's own path, a record is stable forever and a catalogue
-//! update can only ever **add** rows. That is why there is no invalidation
-//! logic in this module: none is reachable.
-//!
-//! Cover images are not here. They are content-addressed by the sha in their
-//! URL and live as files under `covers/` — a re-produced cover arrives under a
-//! new name and orphans the old one, so that cache needs no invalidation
-//! either. There is deliberately no size ceiling on it: the whole catalogue is
-//! roughly 50 MB of covers against a 16–32 GB device, and a cover fetched once
-//! should stay fetched.
+//! The catalogue cache: book records keyed by [`crate::se::url::BookPath`].
+//! A key names a book, never a page, and [`Catalogue::merge`] only ever adds.
+//! Cover images live under `covers/`, held by [`crate::cover_cache`].
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -31,30 +14,25 @@ use crate::se::http::Validators;
 use crate::se::listing::Hit;
 use crate::se::url::BookPath;
 
-/// One book as we persist it. Everything needed to draw a grid cell without
-/// touching the network.
+/// One persisted book, carrying everything a grid cell draws.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     pub title: String,
     pub author: String,
-    /// Cover URL path. Stored as a string because it is only ever re-parsed on
-    /// load, and keeping the validated type out of the on-disk shape means a
-    /// future markup change cannot make the whole cache unreadable.
+    /// Cover URL path, persisted as a string and re-parsed on load.
     pub cover: Option<String>,
 }
 
-/// On-disk shape. Versioned so a format change can be detected and discarded
-/// rather than misread — the only circumstance in which the cache is dropped.
+/// The on-disk shape. [`load`] discards a `version` it does not know.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Catalogue {
     version: u32,
-    /// Validators from the last feed fetch, replayed as `If-None-Match` /
-    /// `If-Modified-Since` to get a 304 next launch.
+    /// Validators from the last feed fetch, replayed as `If-None-Match` and
+    /// `If-Modified-Since`.
     #[serde(default)]
     pub feed: Validators,
-    /// Ordered by book path. A `BTreeMap` rather than a `Vec` so a merge is a
-    /// key-wise insert and duplicate arrivals are idempotent — re-reading a
-    /// listing page must never double a book.
+    /// Ordered by book path. A key-wise insert makes [`Catalogue::merge`]
+    /// idempotent over a re-read listing page.
     #[serde(default)]
     books: BTreeMap<String, Record>,
 }
@@ -71,17 +49,15 @@ impl Default for Catalogue {
     }
 }
 
-/// What a feed check implies about how much we missed.
+/// What a feed check says about the gap.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Freshness {
-    /// Every entry in the feed is already known — nothing to fetch.
+    /// Every feed entry is a known book.
     UpToDate,
-    /// Some entries are new, but the oldest is known, so the feed window spans
-    /// the whole gap and one listing page will close it.
+    /// Some entries are new, the oldest is known: one listing page closes it.
     Behind,
-    /// Even the oldest feed entry is unknown. The device has been off longer
-    /// than the 15-entry window covers, so the gap is of unknown size and must
-    /// be walked page by page until a known book reappears.
+    /// Even the oldest feed entry is unknown: a gap past the 15-entry window,
+    /// walked page by page until [`Catalogue::caught_up`].
     FarBehind,
 }
 
@@ -102,12 +78,8 @@ impl Catalogue {
         self.books.contains_key(path.as_key())
     }
 
-    /// Merge listing hits. Purely additive in the sense that matters: no book
-    /// is ever removed, and the count can only grow. A record already present
-    /// is refreshed in place, which is how a re-produced cover's new URL lands
-    /// without any invalidation step.
-    ///
-    /// Returns how many books were genuinely new.
+    /// Merges listing hits, refreshing a present record in place and removing
+    /// none. Returns the count of new books.
     pub fn merge(&mut self, hits: &[Hit]) -> usize {
         let mut added = 0;
         for hit in hits {
@@ -124,41 +96,31 @@ impl Catalogue {
         added
     }
 
-    /// Classify what the feed tells us, without fetching anything.
-    ///
-    /// The window is 15 entries and SE ships a few books a week, so a device
-    /// left off for a couple of months can have a gap the feed cannot show.
-    /// Detecting that is the difference between a catalogue with a permanent
-    /// hole in it and one that heals.
+    /// [`Freshness`] for `entries`, fetching nothing.
     pub fn freshness(&self, entries: &[feed::Entry]) -> Freshness {
         if entries.is_empty() || entries.iter().all(|e| self.contains(&e.path)) {
             return Freshness::UpToDate;
         }
-        // An empty catalogue is a first run, not a gap. Every feed entry is
-        // unknown because we have never known anything, and the ordinary
-        // browse fetch is about to populate us from page one — so reporting
-        // `FarBehind` here would send a brand-new install off to walk the
-        // catalogue backwards looking for an overlap that cannot exist.
+        // An empty catalogue is a first run. The browse fetch populates it
+        // from page one.
         if self.is_empty() {
             return Freshness::UpToDate;
         }
-        // Entries are newest-first, so the last is the oldest the feed knows.
-        // If we have never seen even that one, everything between it and our
-        // newest is invisible to us.
+        // Entries run newest-first: the last is the oldest the feed carries.
         match entries.last() {
             Some(oldest) if self.contains(&oldest.path) => Freshness::Behind,
             _ => Freshness::FarBehind,
         }
     }
 
-    /// Have we caught up with a listing page? True once a page contains a book
-    /// we already knew, which is the signal to stop walking backwards.
+    /// True once `hits` carries a known book, ending a [`Freshness::FarBehind`]
+    /// walk.
     pub fn overlaps(&self, hits: &[Hit]) -> bool {
         hits.iter().any(|h| self.contains(&h.path))
     }
 }
 
-/// Where the cache lives, relative to the extension bundle.
+/// The cache file under the extension bundle.
 pub fn catalogue_path(bundle_dir: &Path) -> PathBuf {
     bundle_dir.join("cache").join("catalogue.json")
 }
@@ -167,9 +129,8 @@ pub fn covers_dir(bundle_dir: &Path) -> PathBuf {
     bundle_dir.join("cache").join("covers")
 }
 
-/// Read the cache. Any failure — missing, truncated, wrong version — yields an
-/// empty catalogue rather than an error: a corrupt cache should cost a slower
-/// first launch, never a launch.
+/// The cache at `path`. Missing, truncated or a foreign `version` reads as an
+/// empty [`Catalogue`].
 pub fn load(path: &Path) -> Catalogue {
     let Ok(text) = fs::read_to_string(path) else {
         return Catalogue::default();
@@ -180,9 +141,7 @@ pub fn load(path: &Path) -> Catalogue {
     }
 }
 
-/// Write atomically. The user partition is FAT, so a crash mid-write must not
-/// be able to leave a half-written JSON that the next launch would discard —
-/// bytes land in a `.partial` sibling and are renamed over the target.
+/// `catalogue` into a `.partial` sibling, renamed over `path`.
 pub fn store(path: &Path, catalogue: &Catalogue) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -219,15 +178,14 @@ mod tests {
         let hits = hits_from(BROWSE);
         assert_eq!(cat.merge(&hits), hits.len());
         let before = cat.len();
-        // The same page again must not double anything.
+        // The same page twice.
         assert_eq!(cat.merge(&hits), 0);
         assert_eq!(cat.len(), before);
     }
 
     #[test]
     fn a_catalogue_update_adds_rows_and_invalidates_nothing() {
-        // The requirement, stated as a test: new releases arrive, and every
-        // book we already knew is still there afterwards.
+        // New releases arrive; every known book survives.
         let mut cat = Catalogue::default();
         cat.merge(&hits_from(SEARCH));
         let known: Vec<String> = cat.books.keys().cloned().collect();
@@ -254,7 +212,7 @@ mod tests {
     fn a_known_feed_means_nothing_to_do() {
         let mut cat = Catalogue::default();
         let entries = feed::parse(FEED);
-        // Seed the catalogue with exactly the feed's books.
+        // The catalogue seeded with the feed's own books.
         for e in &entries {
             cat.books.insert(
                 e.path.as_key().to_string(),
@@ -280,14 +238,13 @@ mod tests {
                 cover: None,
             },
         );
-        // We know where the feed's window bottoms out, so one page closes it.
+        // The oldest feed entry is known: one page closes the gap.
         assert_eq!(cat.freshness(&entries), Freshness::Behind);
     }
 
     #[test]
     fn a_first_run_is_not_behind() {
-        // Every entry is unknown because nothing is known yet — the browse
-        // fetch populates from page one, so there is no gap to walk.
+        // An empty catalogue: no gap to walk.
         let entries = vec![entry("a/new"), entry("c/old")];
         let cat = Catalogue::default();
         assert!(cat.is_empty());
@@ -296,11 +253,7 @@ mod tests {
 
     #[test]
     fn an_entirely_unknown_feed_means_we_fell_off_the_window() {
-        // A device left off for months: even the oldest of the 15 is unseen,
-        // so the gap is bigger than the feed can describe.
-        //
-        // The catalogue must be non-empty for this to mean anything — with
-        // nothing cached it is a first run, not a gap (see the test above).
+        // Even the oldest of the 15 is unseen, over a non-empty catalogue.
         let mut cat = Catalogue::default();
         cat.books.insert(
             "long/ago".into(),
@@ -332,7 +285,7 @@ mod tests {
         fs::write(&path, b"{ truncated").unwrap();
         assert!(load(&path).is_empty());
 
-        // A future format is discarded rather than misread.
+        // An unknown `version`.
         fs::write(&path, br#"{"version":999,"books":{}}"#).unwrap();
         assert!(load(&path).is_empty());
 

@@ -1,10 +1,6 @@
-//! Cover grid: layout + cell hit-test + image blit.
-//!
-//! grid centered on the panel (see `Layout`), each cell `CELL_W` wide
-//! bounding box. Covers fit inside via aspect-preserving resize (image
-//! crate's `Triangle` filter — bilinear, fast enough on armv7l, and we
-//! don't need Lanczos-quality on a 16-shade eink panel). Missing covers
-//! get a placeholder rect with the title text.
+//! Cover grid: [`Layout`], cell hit-test, image blit. Each cell is [`CELL_W`]
+//! wide and a cover aspect-fits under `image`'s bilinear `Triangle` filter. A
+//! missing cover draws a placeholder rect carrying the title.
 
 use anyhow::Result;
 use image::{DynamicImage, ImageReader, imageops::FilterType};
@@ -14,26 +10,23 @@ use crate::eink::fb::Framebuffer;
 use crate::font::Script;
 use crate::ui::text::TextRenderer;
 
-/// The text in a tile's name band, together with the convention it should be
-/// set in. The two always travel as a pair: a title handed over without its
-/// language is exactly the case that draws Chinese in Japanese shapes (see
-/// [`crate::font`]).
+/// The text in a tile's name band and the convention it is set in. The pair
+/// travels together: a title without its language draws Chinese in Japanese
+/// shapes ([`crate::font`]).
 #[derive(Clone, Copy)]
 pub struct Label<'a> {
     pub text: &'a str,
     pub script: Script,
 }
 
-/// Cell width is fixed. Every Kindle we target is ~300 ppi (KOA2 2102px/7",
-/// Scribe 3100px/10.2"), so a pixel size is a *physical* size across the range:
-/// a bigger panel wants more covers, not larger ones. Only the row/column count
-/// adapts, and height flexes just enough to land one more row.
+/// Cell width, fixed. The fleet runs ~300 ppi (KOA2 2102px/7", Scribe
+/// 3100px/10.2"), making a pixel size a physical size across it. [`Layout`]
+/// adapts the row and column count.
 pub const CELL_W: u32 = 360;
 /// Tallest a cell gets, which is the height the 7" devices settle at.
 pub const CELL_H_MAX: u32 = 440;
-/// Shortest a cell may be squeezed to in order to fit another row. Trades ~3%
-/// of cover height for a whole extra row on a tall panel, which is the better
-/// deal at this density.
+/// Shortest a cell gets. ~3% of cover height buys a whole extra row on a tall
+/// panel.
 pub const CELL_H_MIN: u32 = 420;
 pub const COL_GAP: u32 = 32;
 pub const ROW_GAP: u32 = 20;
@@ -52,13 +45,9 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// Fit as many rows as the panel allows at [`CELL_H_MIN`], then give the
-    /// rows back whatever height is spare, capped at [`CELL_H_MAX`].
-    ///
-    /// Fit-then-expand, not a plain divide: dividing by the maximum height
-    /// loses a row on the Scribe (2210px of usable height is four 440px rows
-    /// with 390px stranded), while fitting at the minimum finds five and settles
-    /// them at 426px. On a 1264×1680 panel the two agree at 3×3.
+    /// Rows fitted at [`CELL_H_MIN`], then given the spare height back up to
+    /// [`CELL_H_MAX`]. A plain divide by the maximum loses a row on the Scribe:
+    /// 2210px is four 440px rows with 390px stranded, against five at 426px.
     pub fn compute(fb_xres: u32, fb_yres: u32, top_margin: u32, strip_h: u32) -> Self {
         let cols = ((fb_xres + COL_GAP) / (CELL_W + COL_GAP)).max(1) as usize;
         let avail = fb_yres.saturating_sub(top_margin + strip_h);
@@ -68,10 +57,8 @@ impl Layout {
 
         let grid_w = cols as u32 * CELL_W + (cols as u32 - 1) * COL_GAP;
 
-        // Centre the block between the search bar and the pager strip. `cell_h`
-        // is clamped to `CELL_H_MAX`, so on a tall panel the rows leave real
-        // slack — ~136px on a 1696px Colorsoft — and anchoring to the top would
-        // spend all of it below the grid.
+        // Centred between the search bar and the pager strip. `cell_h` clamps
+        // to [`CELL_H_MAX`], leaving ~136px of slack on a 1696px Colorsoft.
         let content_h = rows as u32 * cell_h + (rows as u32 - 1) * ROW_GAP;
         let slack = avail.saturating_sub(content_h);
 
@@ -113,8 +100,7 @@ impl Layout {
         if col >= self.cols || row >= self.rows {
             return None;
         }
-        // Reject taps that land in the gap between cells (improves accuracy
-        // — otherwise a tap right between two covers picks the left one).
+        // A tap in the gap between two cells resolves to neither.
         if local_x % stride_x >= CELL_W || local_y % stride_y >= self.cell_h {
             return None;
         }
@@ -137,12 +123,12 @@ const BADGE_MARGIN: u32 = 8;
 const BADGE_PAD: u32 = 12;
 
 // ---- Downloaded marker (see `draw_downloaded_badge`) ----
-/// Diameter of the check disc marking a book already in the library.
+/// Diameter of [`draw_downloaded_badge`]'s check disc.
 const CHECK_D: i32 = 44;
 /// Inset of that disc from the cover's top-right corner.
 const CHECK_MARGIN: i32 = 10;
-/// Shade of the disc. A step lighter than the solid-black chrome (count badge,
-/// arm cue) so the mark reads as state rather than as something to act on.
+/// Shade of the disc, a step lighter than the solid-black chrome: the count
+/// badge and the arm cue.
 const CHECK_SHADE: u8 = 0x55;
 
 /// Decode a JPEG/PNG byte buffer and resize to fit inside `CELL_W × CELL_H_MAX`,
@@ -155,10 +141,9 @@ pub fn decode_resize(bytes: &[u8]) -> Result<DynamicImage> {
     Ok(img.resize(CELL_W, CELL_H_MAX, FilterType::Triangle))
 }
 
-/// The aspect-fit placement of an `iw × ih` image inside the box — the rect
-/// [`blit_fit`] actually paints. Never upscales (`scale` clamped to ≤ 1.0).
-/// Returns `(ox, oy, dw, dh)`; lets callers position chrome (the series tile's
-/// stack bars + count badge) against the displayed cover, not the letterbox box.
+/// The aspect-fit placement of an `iw × ih` image inside the box, the rect
+/// [`blit_fit`] paints. `scale` clamps at 1.0. Returns `(ox, oy, dw, dh)`, which
+/// a caller pins chrome to.
 pub fn fit_rect(
     box_x: i32,
     box_y: i32,
@@ -180,13 +165,9 @@ pub fn fit_rect(
     (ox, oy, dw, dh)
 }
 
-/// Aspect-fit `img` into the box `(box_x, box_y, box_w × box_h)`, centered, and
-/// blit its RGB (placement from [`fit_rect`]). Returns the painted rect. A cover
-/// already resized to ≤ a cell by [`decode_resize`] is copied 1:1 and centered,
-/// while a smaller box (a tile's cover region) gets a nearest-neighbor downscale
-/// (cheap, fine on the panel; no extra `image::resize` allocation per repaint).
-/// Color reaches the Colorsoft; the grayscale KOA2 collapses it to luma in
-/// `send_update`.
+/// `img` aspect-fit into `(box_x, box_y, box_w × box_h)` by [`fit_rect`],
+/// returning the painted rect. A [`decode_resize`] cover copies 1:1; a smaller
+/// box takes a nearest-neighbor downscale.
 pub fn blit_fit(
     fb: &mut Framebuffer,
     box_x: i32,
@@ -220,23 +201,15 @@ pub fn blit_fit(
     rect
 }
 
-/// Frame the pressed cell with a 6px black border so the user knows which is
-/// armed (download for a book, drill-in for a series).
-///
-/// Transient, and the loudest thing the grid draws. A standing property of a
-/// book gets the quieter [`draw_downloaded_badge`] instead.
+/// A 6px black border framing the pressed cell. Transient, and the loudest
+/// thing the grid draws; [`draw_downloaded_badge`] carries standing state.
 pub fn outline_cell(fb: &mut Framebuffer, cell_x: i32, cell_y: i32, cell_h: u32) {
     outline_rect(fb, cell_x, cell_y, CELL_W, cell_h, 6, 0x00);
 }
 
-/// Mark a book already in the library: a small gray check disc in the cover's
-/// top-right corner.
-///
-/// Quieter than the cell itself — a mark on the whole tile would make the one
-/// book needing no attention the page's focal point. Top-right because SE
-/// covers carry a title plate along the bottom edge and the series tile's count
-/// badge owns the bottom-left. `cover` is the painted cover rect from
-/// [`draw_book_cell`]; a zero-size rect (off-screen cell) no-ops.
+/// A gray check disc top-right of `cover`, [`draw_book_cell`]'s painted rect,
+/// marking a book in [`crate::DOWNLOAD_DIR`]. SE covers carry a title plate
+/// along the bottom edge. A zero-size rect no-ops.
 pub fn draw_downloaded_badge(fb: &mut Framebuffer, cover: (i32, i32, u32, u32)) {
     let (ox, oy, w, h) = cover;
     if w == 0 || h == 0 {
@@ -262,10 +235,9 @@ fn fill_disc(fb: &mut Framebuffer, cx: i32, cy: i32, r: i32, shade: u8) {
     }
 }
 
-/// Draw a **check** glyph — the short down-stroke and the long up-stroke —
-/// centered at `(cx, cy)` and scaled to sit inside a disc of radius `r`. The
-/// two strokes are rasterized as one distance test over the glyph's box so the
-/// elbow joins cleanly instead of notching.
+/// A **check** glyph — short down-stroke, long up-stroke — centered at
+/// `(cx, cy)` inside a disc of radius `r`. One distance test over the glyph's
+/// box joins the elbow cleanly.
 fn draw_check_glyph(fb: &mut Framebuffer, cx: i32, cy: i32, r: i32, shade: u8) {
     let (fx, fy, s) = (cx as f32, cy as f32, r as f32);
     let half = (s * 0.15).max(1.0); // half stroke thickness
@@ -298,12 +270,9 @@ fn dist_to_seg(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
     (dx * dx + dy * dy).sqrt()
 }
 
-/// Paint the "armed" cue on a held book cell once the hold crosses the long-press
-/// threshold: a solid dark badge with a light download glyph, centered on the
-/// cover region. Drawn over the press outline, which stays, so the tile reads as
-/// "held long enough — downloading now" in one partial refresh; the cover stays
-/// visible around the badge. The post-action repaint clears it. `(cell_x, cell_y)` is the on-screen cell origin
-/// (see [`cell_xy`]); off-screen no-ops.
+/// The armed cue past `crate::ARM_THRESHOLD`: a dark badge with a light
+/// download glyph over the cover, drawn on [`outline_cell`] in one refresh.
+/// `(cell_x, cell_y)` is [`Layout::cell_xy`]'s origin; off-screen no-ops.
 pub fn draw_arm_cue(fb: &mut Framebuffer, cell_x: i32, cell_y: i32, cell_h: u32) {
     if cell_x < 0 || cell_y < 0 {
         return;
@@ -347,10 +316,9 @@ pub fn outline_rect(
     fb.fill_rect(yu, xu + w - t, t, h, shade); // right
 }
 
-/// Stroke a **rounded-rectangle** border (`thickness` px, corner `radius`) in
-/// `shade` — the search field's pill/box frame. `radius == h/2` gives a full
-/// pill (Amazon-style); a smaller radius gives rounded corners. The straight
-/// edges are `fill_rect`s between the four quarter-circle corner arcs.
+/// A **rounded-rectangle** border (`thickness` px, corner `radius`) in `shade`.
+/// `radius == h/2` gives a full pill. The straight edges are `fill_rect`s
+/// between four quarter-circle corner arcs.
 #[allow(clippy::too_many_arguments)] // positional geometry; a struct just moves the list
 pub fn stroke_round_rect(
     fb: &mut Framebuffer,
@@ -386,9 +354,8 @@ pub fn stroke_round_rect(
     corner_arc(fb, cr, cb, r, t, shade, 1, 1);
 }
 
-/// One quarter-circle arc of the rounded-rect border: pixels in the `r×r` corner
-/// box whose distance from the arc center `(cx, cy)` falls in `[r-t, r]`. `(sx,
-/// sy) ∈ {-1, 1}` selects the quadrant (which way the arc bulges).
+/// One quarter-circle arc: pixels in the `r×r` corner box at distance `[r-t, r]`
+/// from `(cx, cy)`. `(sx, sy) ∈ {-1, 1}` selects the quadrant.
 #[allow(clippy::too_many_arguments)] // positional geometry; a struct just moves the list
 fn corner_arc(fb: &mut Framebuffer, cx: i32, cy: i32, r: u32, t: u32, shade: u8, sx: i32, sy: i32) {
     let rf = r as f32;
@@ -404,7 +371,7 @@ fn corner_arc(fb: &mut Framebuffer, cx: i32, cy: i32, r: u32, t: u32, shade: u8,
 }
 
 /// Draw a magnifier glyph (a ring + a lower-right diagonal handle) centered at
-/// `(cx, cy)` with lens radius `r`. The font has no 🔍, so we draw it.
+/// `(cx, cy)` with lens radius `r`. No face in the chain carries 🔍.
 pub fn draw_magnifier(fb: &mut Framebuffer, cx: i32, cy: i32, r: u32, shade: u8) {
     const T: u32 = 3;
     let rf = r as f32;
@@ -442,10 +409,9 @@ pub fn draw_x(fb: &mut Framebuffer, cx: i32, cy: i32, size: i32, shade: u8) {
     }
 }
 
-/// Draw a **sync** glyph — two arced arrows chasing round a circle (the refresh
-/// pair) — centered at `(cx, cy)` with ring radius `r`. Two arcs with a gap at
-/// each end, each gap capped by a small tangential arrowhead so the ring reads as
-/// rotating. The font has no 🔄, so we draw it. Top-bar Sync button.
+/// A **sync** glyph — two arced arrows round a circle — centered at `(cx, cy)`
+/// with ring radius `r`, each arc gap capped by a tangential arrowhead. No face
+/// in the chain carries 🔄.
 pub fn draw_sync_glyph(fb: &mut Framebuffer, cx: i32, cy: i32, r: i32, shade: u8) {
     const T: i32 = 5;
     let rf = r as f32;
@@ -468,8 +434,8 @@ pub fn draw_sync_glyph(fb: &mut Framebuffer, cx: i32, cy: i32, r: i32, shade: u8
             fb.put_pixel(cx + dx, cy + dy, shade);
         }
     }
-    // Cap each arc's low end with an arrowhead pointing along the clockwise
-    // tangent, so the pair reads as rotation rather than a broken ring.
+    // An arrowhead on each arc's low end, along the clockwise tangent: the
+    // pair reads as rotation.
     sync_arrowhead(fb, cx, cy, rf, 38.0, shade);
     sync_arrowhead(fb, cx, cy, rf, 218.0, shade);
 }
@@ -511,8 +477,8 @@ fn fill_tri(fb: &mut Framebuffer, a: (f32, f32), b: (f32, f32), c: (f32, f32), s
 }
 
 /// Draw a **download** glyph — a vertical stem, a solid down-arrowhead, and a
-/// tray line beneath — centered at `(cx, cy)`, scale `s`. The font has no ⤓, so
-/// we draw it. Top-bar Update button (pull the next picker binary over the LAN).
+/// tray line beneath — centered at `(cx, cy)`, scale `s`. No face in the chain
+/// carries ⤓. [`draw_arm_cue`] paints it over a held cell.
 pub fn draw_download_glyph(fb: &mut Framebuffer, cx: i32, cy: i32, s: i32, shade: u8) {
     const T: i32 = 5;
     let stem_h = s + s / 4;
@@ -542,9 +508,8 @@ pub fn draw_download_glyph(fb: &mut Framebuffer, cx: i32, cy: i32, s: i32, shade
 }
 
 /// Draw a **key** glyph — a ring bow on the left, a horizontal shaft, and two
-/// teeth dropping off its tip — centered at `(cx, cy)`, scale `s`. The font has
-/// no 🔑, so we draw it. The DRM view's right-hand action button (decrypt every
-/// purchase); the library view draws [`draw_download_glyph`] in that slot.
+/// teeth dropping off its tip — centered at `(cx, cy)`, scale `s`. No face in
+/// the chain carries 🔑.
 pub fn draw_key_glyph(fb: &mut Framebuffer, cx: i32, cy: i32, s: i32, shade: u8) {
     const T: i32 = 5;
     // Bow: a ring on the left, a hair inside where the shaft meets it.
@@ -586,13 +551,9 @@ pub fn draw_key_glyph(fb: &mut Framebuffer, cx: i32, cy: i32, s: i32, shade: u8)
     }
 }
 
-/// Clear the cell to white, aspect-fit the cover into the region between
-/// `top_inset` and the bottom name band, then draw that band with `label`
-/// (single line, centered, ellipsized). Returns the painted cover rect so a
-/// caller can overlay chrome on it. Shared by [`draw_book_cell`] and
-/// [`draw_series_cell`]: `top_inset` is 0 for a standalone book (the cover uses
-/// the full height above the band) and `BAR_STRIP_H` for a series (leaving room
-/// for the stack bars). Off-screen cells no-op with a zero-size rect.
+/// The cell cleared to white, the cover aspect-fit between `top_inset` and the
+/// name band, `label` in that band. Returns the painted cover rect. `top_inset`
+/// is 0 for a book and `BAR_STRIP_H` for a series; off-screen no-ops.
 #[allow(clippy::too_many_arguments)]
 fn draw_cover_tile(
     fb: &mut Framebuffer,
@@ -639,15 +600,9 @@ fn draw_cover_tile(
     rect
 }
 
-/// Render a standalone book tile: the cover (aspect-fit, full-width, no frame)
-/// above a name band carrying the book title — the same layout as a series tile
-/// minus the stack bars and count badge, so books and collections line up in
-/// the grid. A missing cover falls back to a light placeholder + the title.
-/// Self-contained (clears its own cell) for both the initial paint and the
-/// per-cover refresh in `main.rs`. Returns the painted cover rect, which is the
-/// letterboxed artwork rather than the cell — [`draw_downloaded_badge`] pins
-/// its corner to that, so the mark lands on the cover and not in the margin
-/// beside a narrow one.
+/// A book tile: a full-width cover over a name band, a series tile minus the
+/// stack bars and count badge. Clears its own cell. Returns the letterboxed
+/// artwork rect, which [`draw_downloaded_badge`] pins its corner to.
 pub fn draw_book_cell(
     fb: &mut Framebuffer,
     renderer: &mut TextRenderer,
@@ -660,12 +615,9 @@ pub fn draw_book_cell(
     draw_cover_tile(fb, renderer, cell_x, cell_y, cell_h, 0, cover, title)
 }
 
-/// Render a series-collection tile: the shared cover tile (see
-/// [`draw_cover_tile`]) with the series name in the band, plus two **book-edge
-/// bars** stacked just above the cover (narrower as they recede, lighter the
-/// further back — a "stack of volumes" hint) and a solid dark **count badge**
-/// (light number = available-to-download members) at the cover's bottom-left.
-/// Self-contained for both the placeholder paint and the per-cover refresh.
+/// A series tile: [`draw_cover_tile`] with the series name in the band, two
+/// **book-edge bars** above the cover (narrower and lighter as they recede),
+/// and a dark **count badge** bottom-left. Clears its own cell.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_series_cell(
     fb: &mut Framebuffer,
@@ -677,8 +629,8 @@ pub fn draw_series_cell(
     count: usize,
     name: Label,
 ) {
-    // Series reserve BAR_STRIP_H above the cover for the stack bars; the cover
-    // is otherwise identical to a book's, so the two line up in the grid.
+    // A series reserves [`BAR_STRIP_H`] above the cover for its stack bars.
+    // The cover itself matches a book's, lining the two up in the grid.
     let (cov_x, cov_y, cov_w, cov_h) = draw_cover_tile(
         fb,
         renderer,
@@ -738,11 +690,9 @@ pub fn draw_series_cell(
 mod tests {
     use super::*;
 
-    /// The adaptive path must give the 7" panels 3×3 at the full cell height.
-    ///
-    /// Both geometries are checked because they differ: a Colorsoft reports
-    /// 1272×1696, not 1264×1680, and a rule holding only for the rounder number
-    /// holds for no real device.
+    /// The 7" panels take 3×3 at the full cell height. Both geometries are
+    /// checked: a Colorsoft reports 1272×1696, and a rule holding for
+    /// 1264×1680 alone holds for no real device.
     #[test]
     fn seven_inch_panels_are_unchanged() {
         for (w, h, expect_left) in [(1264u32, 1680u32, 60i32), (1272, 1696, 64)] {
@@ -761,8 +711,7 @@ mod tests {
         assert_eq!((l.cols, l.rows), (4, 5));
         assert_eq!(l.page_size(), 20);
         assert_eq!(l.left, 162);
-        // Fit-then-expand: five rows only exist below CELL_H_MAX, and the result
-        // must still clear the floor.
+        // Fit-then-expand: five rows exist below [`CELL_H_MAX`], over the floor.
         assert!(
             (CELL_H_MIN..CELL_H_MAX).contains(&l.cell_h),
             "cell_h {} outside [{CELL_H_MIN}, {CELL_H_MAX})",
@@ -776,8 +725,8 @@ mod tests {
         );
     }
 
-    /// A panel too small for even one full cell must still yield a usable grid
-    /// rather than a divide-by-zero or an empty page.
+    /// A panel under one full cell yields a usable grid, past a divide-by-zero
+    /// and an empty page.
     #[test]
     fn degenerate_panel_still_yields_one_cell() {
         let l = Layout::compute(100, 100, 190, 80);

@@ -1,24 +1,4 @@
-# Workspace cargo config.
-#
-# Target-specific only — keeps host (macOS) builds untouched and only kicks in
-# when cross-compiling to the Kindle.
-#
-# Build the on-device binary:
-#   cargo build --release --target armv7-unknown-linux-musleabihf -p steb-native
-#
-# armv7-unknown-linux-musleabihf covers the whole fleet: the KOA2's Cortex-A9
-# and the newer MediaTek devices (Colorsoft, Scribe), which still run a 32-bit
-# armv7 userspace. musl = static link, so the binary is firmware-agnostic.
-#
-# Linker: rustc's bundled rust-lld via `link-self-contained=yes`. This is the
-# pure-Rust cross path — no zig, no GNU cross-binutils. It holds as long as no
-# crate in the graph has a C build-script, which is why every dependency in
-# native/Cargo.toml is pure Rust (rustls rather than native-tls especially).
-# If that ever changes, the fallback is `cargo install cargo-zigbuild`.
-#
-# `rust-lld` needs no PATH entry and no symlink: rustc resolves the name from its
-# own sysroot. `link-self-contained` is a separate knob, supplying the musl crt
-# objects.
+# `rust-lld` and the musl crt objects for armv7-unknown-linux-musleabihf.
 [target.armv7-unknown-linux-musleabihf]
 linker = "rust-lld"
 rustflags = ["-C", "link-self-contained=yes"]
