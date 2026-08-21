@@ -3,4 +3,6 @@
 
 artifacts/
 /target
-device/extensions/steb/bin/
+# What build.sh stages into the install tree. bin/steb.sh beside it is the
+# tracked launcher both the tile and the KUAL entry run.
+device/extensions/steb/bin/steb

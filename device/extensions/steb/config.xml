@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<extension>
+	<information>
+		<name>Steb</name>
+		<version>0.2.0</version>
+		<author>_hzw</author>
+		<id>steb</id>
+	</information>
+	<menus>
+		<menu type="json" dynamic="true">menu.json</menu>
+	</menus>
+</extension>

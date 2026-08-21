@@ -38,7 +38,7 @@ const BUNDLE_DIR: &str = "/mnt/us/extensions/steb";
 const DOWNLOAD_DIR: &str = "/mnt/us/documents/standardebooks";
 /// Kindle's own cover thumbnails, taking a `ThumbnailHref::file_name` verbatim.
 const THUMBNAILS_DIR: &str = "/mnt/us/system/thumbnails";
-/// Where `Steb.sh` funnels this process's stderr.
+/// Where `bin/steb.sh` funnels this process's stderr.
 const LOG_PATH: &str = "/mnt/us/logs/steb.log";
 
 const FONT_PX: f32 = 32.0;
@@ -77,7 +77,7 @@ struct Armed {
     at: (u32, u32),
 }
 
-/// One line to stderr, which `Steb.sh` redirects into [`LOG_PATH`].
+/// One line to stderr, which `bin/steb.sh` redirects into [`LOG_PATH`].
 /// Never [`LOG_PATH`] directly: that doubles every line.
 fn log(msg: impl AsRef<str>) {
     eprintln!("[{}] {}", now(), msg.as_ref());

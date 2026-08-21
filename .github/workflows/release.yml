@@ -1,32 +1,18 @@
-# Publish a release on GitHub, get the install tree attached to it.
-#
-#   Releases -> Draft a new release -> tag v0.1.0 -> Publish
-#
-# **Publishing is what starts this, not the tag.** The release is written by
-# hand and this only ever adds files to one that already exists, so a tag pushed
-# on its own builds nothing and a draft waits until it is published. Assets are
-# replaced rather than added to, which is what makes a failed run safe to re-run
-# from the Actions tab without touching the release.
-#
-# The tag has to match [workspace.package] in Cargo.toml; the job stops if it
-# does not. That version is compiled in as CARGO_PKG_VERSION and is what the
-# startup line in /mnt/us/logs/steb.log and the HTTP user agent both report, so
-# a release whose name disagrees with it cannot be traced from either end.
-#
-# Nothing about the build is CI-specific. One armv7 musl target covers the whole
-# fleet and the cross link goes through rustc's own bundled rust-lld, so a
-# runner needs the target and nothing else — no sysroot, no C toolchain. build.sh
-# is the same script a workstation runs. The zip is not part of that tree and is
-# made here alone: locally device/ is what gets dragged over USB, and an archive
-# of it would be a build product nobody opens.
+# Release — attaches the device/ zip to a published or edited GitHub release.
+# `workflow_dispatch` on a blank `tag` builds and tests a ref, attaching
+# nothing.
 
 name: Release
 
 on:
     release:
-        types: [published]
-    # For a dry run on a branch: builds, and attaches nothing to anything.
+        types: [published, edited]
     workflow_dispatch:
+        inputs:
+            tag:
+                description: "Release tag to rebuild (blank: build only)"
+                required: false
+                default: ""
 
 permissions:
     contents: write
@@ -35,16 +21,19 @@ jobs:
     release:
         runs-on: ubuntu-latest
 
-        steps:
-            - uses: actions/checkout@v4
+        # $TAG is the release tag, empty on a dispatch that names none.
+        env:
+            TAG: ${{ github.event.release.tag_name || inputs.tag }}
 
-            # Read the version the way build.sh reads it — section-aware, so it
-            # is the [workspace.package] key being compared and not some other
-            # `version =` that grows into the file later.
+        steps:
+            # `ref` is $TAG, or actions/checkout's default when blank.
+            - uses: actions/checkout@v4
+              with:
+                  ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+            # awk reads [workspace.package].version section-aware, as ./build.sh does.
             - name: Check the tag against Cargo.toml
-              if: github.event_name == 'release'
-              env:
-                  TAG: ${{ github.event.release.tag_name }}
+              if: env.TAG != ''
               run: |
                   crate=$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0}
                                f && /^version *=/{gsub(/[" ]/,""); sub(/^version=/,""); print; exit}' \
@@ -55,13 +44,10 @@ jobs:
                   fi
                   echo "version $crate"
 
-            # build.sh stops before it starts if this is missing, rather than
-            # letting cargo fail on a missing core.
             - name: Install the cross target
               run: rustup target add armv7-unknown-linux-musleabihf
 
-            # rustls-rustcrypto is pinned to a git rev, so ~/.cargo/git carries
-            # as much weight here as the registry does.
+            # ~/.cargo/git holds git-pinned dependency revs.
             - uses: actions/cache@v4
               with:
                   path: |
@@ -70,9 +56,6 @@ jobs:
                       target
                   key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
-            # Host build. The live tests are #[ignore] by default and stay that
-            # way here: cutting a release is no reason to put load on
-            # standardebooks.org.
             - name: Format, lint, test
               run: |
                   cargo fmt --all --check
@@ -85,37 +68,24 @@ jobs:
             - name: Package
               id: package
               env:
-                  VERSION: ${{ github.event.release.tag_name || github.ref_name }}
+                  VERSION: ${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
               run: |
-                  # One asset, not one per model: the build is not told which
-                  # Kindle it is for, so there is nothing to name it after. The
-                  # slash is squashed so a dry run from a branch like feat/x
-                  # still names a file rather than a missing directory.
+                  # `tr / -` squashes a $VERSION like feat/x to one path segment.
                   name="steb-$(echo "$VERSION" | tr / -)-kindle"
-                  # Zipped from inside device/ so the archive opens onto
-                  # extensions/ and documents/, which are what go to /mnt/us.
-                  # assets/ and make-tile.sh stay behind — they build the tile's
-                  # embedded icon and have no place on the device. .DS_Store is
-                  # dropped because device/ is a tree people open in Finder.
+                  # extensions/ and documents/ open at the archive root, as under /mnt/us.
                   (cd device && zip -qr "$RUNNER_TEMP/$name.zip" extensions documents -x '*.DS_Store')
-                  # GPLv3 conveys the license with the object code, so it rides
-                  # along at the archive root rather than on the device: whoever
-                  # unzips this has it, and /mnt/us stays as it was.
+                  # LICENSE rides at the archive root, off the device.
                   zip -q "$RUNNER_TEMP/$name.zip" LICENSE
-                  # Written from inside $RUNNER_TEMP so the sidecar names the
-                  # zip alone and `sha256sum -c` works where the two land.
+                  # `cd "$RUNNER_TEMP"` keeps the sidecar's path relative.
                   (cd "$RUNNER_TEMP" && sha256sum "$name.zip" > "$name.zip.sha256")
                   echo "name=$name" >> "$GITHUB_OUTPUT"
                   ls -lh "$RUNNER_TEMP/$name.zip"
 
-            # `--clobber` replaces an asset of the same name instead of refusing
-            # it, so re-running after a failure lands the same two files rather
-            # than needing the release taken apart first.
+            # `--clobber` replaces an asset of the same name.
             - name: Attach to the release
-              if: github.event_name == 'release'
+              if: env.TAG != ''
               env:
                   GH_TOKEN: ${{ github.token }}
-                  TAG: ${{ github.event.release.tag_name }}
                   NAME: ${{ steps.package.outputs.name }}
               run: |
                   gh release upload "$TAG" \
@@ -124,7 +94,7 @@ jobs:
                     --clobber
 
             - name: Keep the tree from a manual run
-              if: github.event_name != 'release'
+              if: env.TAG == ''
               uses: actions/upload-artifact@v4
               with:
                   name: ${{ steps.package.outputs.name }}

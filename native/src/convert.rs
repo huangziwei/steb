@@ -153,4 +153,25 @@ mod tests {
     fn a_missing_binary_resolves_to_no_converter() {
         assert_eq!(locate_at(Path::new("/nonexistent/bokai")), None);
     }
+
+    #[test]
+    fn a_directory_at_the_path_resolves_to_no_converter() {
+        assert_eq!(locate_at(&std::env::temp_dir()), None);
+    }
+
+    /// `exe` written without an execute bit.
+    #[cfg(unix)]
+    #[test]
+    fn an_unrunnable_binary_resolves_to_no_converter() {
+        let exe = std::env::temp_dir().join("steb-bokai-no-mode-bits");
+        fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
+        assert_eq!(locate_at(&exe), None);
+        let _ = fs::remove_file(&exe);
+    }
+
+    #[test]
+    fn a_staged_path_that_was_never_written_removes_clean() {
+        let staged = staging_path(Path::new("/nonexistent/steb/bram-stoker_dracula.kfx"));
+        assert!(remove_if_present(&staged).is_ok());
+    }
 }
