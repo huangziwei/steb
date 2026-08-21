@@ -1,12 +1,12 @@
-# Release — attaches the device/ zip to a published or edited GitHub release.
-# `workflow_dispatch` on a blank `tag` builds and tests a ref, attaching
-# nothing.
+# Release — attaches the device/ zip to a `published` GitHub release.
+# `workflow_dispatch` names a `tag` to rebuild, or on a blank one builds and
+# tests a ref, attaching nothing.
 
 name: Release
 
 on:
     release:
-        types: [published, edited]
+        types: [published]
     workflow_dispatch:
         inputs:
             tag:
@@ -72,11 +72,11 @@ jobs:
               run: |
                   # `tr / -` squashes a $VERSION like feat/x to one path segment.
                   name="steb-$(echo "$VERSION" | tr / -)-kindle"
-                  # extensions/ and documents/ open at the archive root, as under /mnt/us.
+                  # extensions/ and documents/ open at the archive root.
                   (cd device && zip -qr "$RUNNER_TEMP/$name.zip" extensions documents -x '*.DS_Store')
-                  # LICENSE rides at the archive root, off the device.
+                  # LICENSE rides at the archive root.
                   zip -q "$RUNNER_TEMP/$name.zip" LICENSE
-                  # `cd "$RUNNER_TEMP"` keeps the sidecar's path relative.
+                  # `cd "$RUNNER_TEMP"` keeps the path in $name.zip.sha256 relative.
                   (cd "$RUNNER_TEMP" && sha256sum "$name.zip" > "$name.zip.sha256")
                   echo "name=$name" >> "$GITHUB_OUTPUT"
                   ls -lh "$RUNNER_TEMP/$name.zip"
