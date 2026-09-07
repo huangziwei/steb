@@ -17,6 +17,29 @@ use x11rb::wrapper::ConnectionExt as _;
 /// Where the dump lands: the user partition, reachable over USB or MTP.
 const OUT_PATH: &str = "/mnt/us/steb-xprobe.txt";
 
+/// `bits_per_pixel / 8` and `scanline_pad / 8` for `depth`, from
+/// `pixmap_formats`. A depth the server does not list answers `(1, 4)`.
+fn wire_format(conn: &impl Connection, depth: u8) -> (usize, usize) {
+    conn.setup()
+        .pixmap_formats
+        .iter()
+        .find(|f| f.depth == depth)
+        .map(|f| {
+            (
+                (f.bits_per_pixel as usize / 8).max(1),
+                (f.scanline_pad as usize / 8).max(1),
+            )
+        })
+        .unwrap_or((1, 4))
+}
+
+/// `width` pixels at `bpp` rounded up to `pad`, the bytes `put_image` takes per
+/// ZPixmap scanline.
+fn row_bytes(width: usize, bpp: usize, pad: usize) -> usize {
+    let pad = pad.max(1);
+    (width * bpp).div_ceil(pad) * pad
+}
+
 pub fn run() -> Result<()> {
     let mut o = String::new();
     let _ = writeln!(o, "== steb X/eink probe ==");
@@ -62,8 +85,7 @@ fn probe_x(o: &mut String) {
         setup.maximum_request_length,
         setup.maximum_request_length as usize * 4
     );
-    // The negotiated limit. If this equals the line above, BIG-REQUESTS is absent
-    // — which changes how a full-screen paint must be split.
+    // `maximum_request_bytes()` equals `maximum_request_length` * 4 without BIG-REQUESTS.
     let _ = writeln!(
         o,
         "maximum_request_bytes()={} (BIG-REQUESTS {})",
@@ -108,7 +130,7 @@ fn probe_x(o: &mut String) {
         }
     }
 
-    // A lab126 or eink-specific extension here names the refresh mechanism.
+    // `list_extensions` names any lab126 or eink refresh mechanism.
     let _ = writeln!(o, "\n[extensions]");
     match conn
         .list_extensions()
@@ -134,21 +156,14 @@ fn probe_x(o: &mut String) {
     probe_paint(&conn, &screen, o);
 }
 
-/// A paint the way `crate::eink::fb` does it, timing the server's
-/// acknowledgement. Each band reports separately, its round-trip turning an
-/// asynchronous protocol error into a value printed beside it.
+/// Paint in bands and time each one's round trip. Every band reports its own
+/// byte count, elapsed time and error.
 fn probe_paint(conn: &impl Connection, screen: &x11rb::protocol::xproto::Screen, o: &mut String) {
     let _ = writeln!(o, "\n[paint test]");
     let xres = screen.width_in_pixels as usize;
     let yres = screen.height_in_pixels as usize;
     let depth = screen.root_depth;
-    let bpp = conn
-        .setup()
-        .pixmap_formats
-        .iter()
-        .find(|f| f.depth == depth)
-        .map(|f| (f.bits_per_pixel as usize / 8).max(1))
-        .unwrap_or(1);
+    let (bpp, pad) = wire_format(conn, depth);
 
     let win = match conn.generate_id() {
         Ok(w) => w,
@@ -212,14 +227,13 @@ fn probe_paint(conn: &impl Connection, screen: &x11rb::protocol::xproto::Screen,
     };
     let _ = conn.create_gc(gc, win, &CreateGCAux::new());
 
-    // Alternate black and white bands so a landed band is unmistakable on the
-    // panel by eye, independent of what this file says.
+    // `shade` alternates 0x00 and 0xFF across the bands.
     for (label, limit) in [
         ("256KB", 256 * 1024usize),
         ("1MB", 1024 * 1024),
-        ("full-screen", xres * yres * bpp + 1024),
+        ("full-screen", yres * row_bytes(xres, bpp, pad) + 1024),
     ] {
-        let stride = xres * bpp;
+        let stride = row_bytes(xres, bpp, pad);
         let max_rows = (limit.saturating_sub(64) / stride.max(1)).max(1).min(yres);
         let bands = yres.div_ceil(max_rows);
         let t0 = Instant::now();
@@ -247,8 +261,7 @@ fn probe_paint(conn: &impl Connection, screen: &x11rb::protocol::xproto::Screen,
             }
             y += h;
         }
-        // Round-trip: the server cannot answer until it has processed every
-        // request above, so this both times the work and surfaces their errors.
+        // `get_input_focus` replies once the server has processed the requests above.
         let sync = conn
             .get_input_focus()
             .map_err(|e| e.to_string())
@@ -263,7 +276,7 @@ fn probe_paint(conn: &impl Connection, screen: &x11rb::protocol::xproto::Screen,
                 Err(e) => e.to_string(),
             }
         );
-        // Anything the server complained about asynchronously lands here.
+        // `poll_for_event` delivers asynchronous protocol errors.
         while let Ok(Some(ev)) = conn.poll_for_event() {
             if let x11rb::protocol::Event::Error(e) = ev {
                 let _ = writeln!(o, "  {label}: X error {e:?}");
@@ -271,15 +284,14 @@ fn probe_paint(conn: &impl Connection, screen: &x11rb::protocol::xproto::Screen,
         }
     }
 
-    probe_supersession(conn, screen, win, gc, xres, yres, bpp, depth, o);
+    probe_supersession(conn, screen, win, gc, xres, yres, bpp, pad, depth, o);
 
     let _ = conn.destroy_window(win);
     let _ = conn.flush();
 }
 
-/// Does a burst of small updates cancel an in-flight full-screen refresh? A
-/// full-screen `GC16` over 4.6M pixels, then twenty partials without waiting.
-/// The outcome lives on the panel: X reports success either way.
+/// Paint full-screen against a burst of small updates, in three phases. Every
+/// phase prints what it painted.
 #[allow(clippy::too_many_arguments)]
 fn probe_supersession(
     conn: &impl Connection,
@@ -289,10 +301,11 @@ fn probe_supersession(
     xres: usize,
     yres: usize,
     bpp: usize,
+    pad: usize,
     depth: u8,
     o: &mut String,
 ) {
-    let stride = xres * bpp;
+    let stride = row_bytes(xres, bpp, pad);
     let full = |shade: u8| vec![shade; yres * stride];
 
     let paint_full = |shade: u8| {
@@ -311,7 +324,7 @@ fn probe_supersession(
         );
     };
 
-    // 24 small squares scattered down the screen, mimicking the per-cover burst.
+    // 24 squares of `S` down the screen.
     let paint_squares = |shade: u8| {
         const S: usize = 120;
         for i in 0..24usize {
@@ -320,7 +333,7 @@ fn probe_supersession(
             if x + S > xres {
                 continue;
             }
-            let buf = vec![shade; S * S * bpp];
+            let buf = vec![shade; S * row_bytes(S, bpp, pad)];
             let _ = conn.put_image(
                 ImageFormat::Z_PIXMAP,
                 win,
@@ -345,8 +358,7 @@ fn probe_supersession(
         "Watch the panel. Each phase pauses 3s so you can see the result."
     );
 
-    // Phase 1 — control. A full paint with nothing competing. Establishes that a
-    // full refresh does land, and how long it takes to become visible.
+    // Phase 1: a full paint with nothing competing.
     let t = Instant::now();
     paint_full(0x00);
     let _ = conn
@@ -361,8 +373,7 @@ fn probe_supersession(
     );
     std::thread::sleep(std::time::Duration::from_secs(3));
 
-    // Phase 2 — the real question. Full paint immediately followed by the burst,
-    // exactly as `repaint_page` sequences them.
+    // Phase 2: a full paint immediately followed by the burst.
     let t = Instant::now();
     paint_full(0xFF);
     paint_squares(0x00);
@@ -380,9 +391,7 @@ fn probe_supersession(
     );
     std::thread::sleep(std::time::Duration::from_secs(3));
 
-    // Phase 3 — the candidate fix. Same content, but let the full refresh settle
-    // before the partials go out. If phase 2 failed and this succeeds, the cure
-    // is sequencing, not upload size.
+    // Phase 3: the same content, with a settle ahead of the partials.
     let t = Instant::now();
     paint_full(0xFF);
     let _ = conn
@@ -411,9 +420,8 @@ fn probe_supersession(
     }
 }
 
-/// Does `BackingStore::ALWAYS` stop paints from reaching the panel? This window
-/// asks for it, which `crate::eink::fb` does not. Two windows, the same paints,
-/// one difference.
+/// Paint the same content into two windows, one with `BackingStore::ALWAYS`
+/// and one without.
 fn probe_backing_store(o: &mut String) {
     let _ = writeln!(o, "\n[backing-store test]");
     let (conn, screen_num) = match x11rb::connect(None) {
@@ -427,13 +435,7 @@ fn probe_backing_store(o: &mut String) {
     let xres = screen.width_in_pixels as usize;
     let yres = screen.height_in_pixels as usize;
     let depth = screen.root_depth;
-    let bpp = conn
-        .setup()
-        .pixmap_formats
-        .iter()
-        .find(|f| f.depth == depth)
-        .map(|f| (f.bits_per_pixel as usize / 8).max(1))
-        .unwrap_or(1);
+    let (bpp, pad) = wire_format(&conn, depth);
 
     for (label, backing) in [
         ("WITHOUT backing store", false),
@@ -484,7 +486,7 @@ fn probe_backing_store(o: &mut String) {
                 .and_then(|c| c.reply().map(|_| ()).map_err(|e| e.to_string()));
         };
         let put = |shade: u8, w: usize, h: usize, x: i16, y: i16| {
-            let buf = vec![shade; w * h * bpp];
+            let buf = vec![shade; h * row_bytes(w, bpp, pad)];
             let _ = conn.put_image(
                 ImageFormat::Z_PIXMAP,
                 win,
@@ -499,8 +501,7 @@ fn probe_backing_store(o: &mut String) {
             );
         };
 
-        // Black, then white with squares: the shape the plain-window phase
-        // passed on, leaving the flag as the one difference.
+        // `put` paints black, then white with squares.
         put(0x00, xres, yres, 0, 0);
         sync(&conn);
         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -535,9 +536,8 @@ fn probe_backing_store(o: &mut String) {
     }
 }
 
-/// Known squares painted, then `/dev/fb0` read back for what arrived: the stage
-/// after X and before the panel. The per-square coverage table separates a
-/// stride shear (1872 against X's 1860) from an update-region limit.
+/// Paint known squares, read `/dev/fb0` back, and print per-square coverage
+/// with the dark rows of each.
 fn probe_fb_readback(o: &mut String) {
     let _ = writeln!(o, "\n[framebuffer readback]");
 
@@ -566,13 +566,7 @@ fn probe_fb_readback(o: &mut String) {
     let xres = screen.width_in_pixels as usize;
     let yres = screen.height_in_pixels as usize;
     let depth = screen.root_depth;
-    let bpp = conn
-        .setup()
-        .pixmap_formats
-        .iter()
-        .find(|f| f.depth == depth)
-        .map(|f| (f.bits_per_pixel as usize / 8).max(1))
-        .unwrap_or(1);
+    let (bpp, pad) = wire_format(&conn, depth);
     if xres != fb_w {
         let _ = writeln!(
             o,
@@ -620,7 +614,7 @@ fn probe_fb_readback(o: &mut String) {
             .and_then(|c| c.reply().map(|_| ()).map_err(|e| e.to_string()));
     };
 
-    // A white field, then squares at checkable grid positions.
+    // `white` fills the field; `squares` holds the grid.
     const S: usize = 120;
     let squares: Vec<(usize, usize)> = (0..24)
         .map(|i| {
@@ -631,7 +625,7 @@ fn probe_fb_readback(o: &mut String) {
         .filter(|(x, y)| x + S <= xres && y + S <= yres)
         .collect();
 
-    let white = vec![0xFFu8; yres * xres * bpp];
+    let white = vec![0xFFu8; yres * row_bytes(xres, bpp, pad)];
     let _ = conn.put_image(
         ImageFormat::Z_PIXMAP,
         win,
@@ -647,7 +641,7 @@ fn probe_fb_readback(o: &mut String) {
     sync();
     std::thread::sleep(std::time::Duration::from_millis(1500));
 
-    let black = vec![0x00u8; S * S * bpp];
+    let black = vec![0x00u8; S * row_bytes(S, bpp, pad)];
     for (x, y) in &squares {
         let _ = conn.put_image(
             ImageFormat::Z_PIXMAP,
@@ -665,8 +659,7 @@ fn probe_fb_readback(o: &mut String) {
     sync();
     std::thread::sleep(std::time::Duration::from_millis(1500));
 
-    // Read both pages: the panel is double-buffered (virtual height is 2x), and
-    // which one is live is not exposed, so report whichever matches.
+    // `page_bytes` covers one of the two pages `fb_h` spans.
     let page_bytes = fb_w * yres * fb_bpp;
     for page in 0..2usize {
         let Some(buf) = read_fb_page(page * page_bytes, page_bytes) else {
@@ -677,8 +670,7 @@ fn probe_fb_readback(o: &mut String) {
             let idx = y * fb_w * fb_bpp + x * fb_bpp;
             buf.get(idx).is_some_and(|v| *v < 0x40)
         };
-        // Coverage per square, plus which rows of it are dark — a shear shows as
-        // rows drifting, a dropped update as a clean cut.
+        // `summary` holds coverage per square and its dark rows.
         let mut summary = Vec::new();
         for (i, (x, y)) in squares.iter().enumerate() {
             let mut dark_px = 0usize;
@@ -731,8 +723,7 @@ fn read_fb_page(offset: usize, len: usize) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-/// The pre-X refresh paths, one of which drives the panel where the X server
-/// does not.
+/// The pre-X refresh paths: which exist, and what each reports.
 fn probe_eink_paths(o: &mut String) {
     let _ = writeln!(o, "\n[eink control paths]");
     for p in [
@@ -756,8 +747,7 @@ fn probe_eink_paths(o: &mut String) {
             }
         );
     }
-    // fb0's own view of the panel, when it is readable — the geometry the eink
-    // controller believes in, which need not match what X reports.
+    // fb0's own geometry.
     for p in [
         "/sys/class/graphics/fb0/virtual_size",
         "/sys/class/graphics/fb0/bits_per_pixel",

@@ -1,6 +1,6 @@
-//! Display surface: a WM-managed fullscreen X11 window. Drawing lands in a
-//! packed-RGB backing ([`CH`] bytes/pixel, white=255) and reaches the server
-//! through [`Framebuffer::send_update`]. Rendering is identity.
+//! Display surface: a WM-managed fullscreen X11 window. `backing` holds packed
+//! RGB ([`CH`] bytes/pixel, white=255) and reaches the server at identity
+//! through [`Framebuffer::send_update`].
 
 use std::path::Path;
 
@@ -27,8 +27,8 @@ pub const WAVEFORM_MODE_GC16: u32 = 2;
 /// Bytes per pixel in the backing store: packed RGB, no alpha.
 pub const CH: usize = 3;
 
-/// Rec. 601 luma, the depth-8 wire collapse. The weights sum to 256, keeping
-/// `>> 8` an integer multiply-shift.
+/// Rec. 601 luma, the depth-8 wire collapse. 77, 150 and 29 sum to 256, and
+/// `>> 8` divides by it.
 #[inline]
 fn luma(r: u8, g: u8, b: u8) -> u8 {
     ((r as u32 * 77 + g as u32 * 150 + b as u32 * 29) >> 8) as u8
@@ -50,8 +50,8 @@ fn wire_channels(conn: &RustConnection, screen: &Screen, bpp: usize) -> Option<[
         return None;
     }
     let msb = conn.setup().image_byte_order == ImageOrder::MSB_FIRST;
-    // A mask sits in one byte of the native-endian pixel, at index
-    // `trailing_zeros / 8`. MSBFirst mirrors that index across the width.
+    // `mask` sits in one byte of the native-endian pixel, at `trailing_zeros / 8`.
+    // `msb` mirrors that index across `bpp`.
     let offset = |mask: u32| -> usize {
         let idx = (mask.trailing_zeros() / 8) as usize;
         if msb { bpp - 1 - idx } else { idx }
@@ -61,6 +61,52 @@ fn wire_channels(conn: &RustConnection, screen: &Screen, bpp: usize) -> Option<[
         offset(visual.green_mask),
         offset(visual.blue_mask),
     ])
+}
+
+/// `pixel_bytes` rounded up to a multiple of `pad`, the bytes `put_image` takes
+/// per ZPixmap scanline.
+fn wire_stride(pixel_bytes: usize, pad: usize) -> usize {
+    let pad = pad.max(1);
+    pixel_bytes.div_ceil(pad) * pad
+}
+
+/// `band`'s packed-RGB rows, `xres` wide, into `wire`: one `bpp`-byte wire
+/// pixel each, rows `wire_stride` apart with the pad left at 0xFF. `bpp == 1`
+/// collapses to one luma byte; wider scatters R/G/B to `chan`.
+fn pack_band(
+    wire: &mut Vec<u8>,
+    band: &[u8],
+    xres: usize,
+    bpp: usize,
+    wire_stride: usize,
+    chan: [usize; 3],
+) {
+    wire.clear();
+    let bk_stride = xres * CH;
+    if bk_stride == 0 || wire_stride == 0 {
+        return;
+    }
+    let pixel_bytes = xres * bpp;
+    let [rb, gb, bb] = chan;
+    wire.resize(band.len() / bk_stride * wire_stride, 0xFF);
+    for (out, row) in wire
+        .chunks_exact_mut(wire_stride)
+        .zip(band.chunks_exact(bk_stride))
+    {
+        let (triples, _) = row.as_chunks::<CH>();
+        let pairs = out[..pixel_bytes].chunks_exact_mut(bpp).zip(triples);
+        if bpp == 1 {
+            for (w, rgb) in pairs {
+                w[0] = luma(rgb[0], rgb[1], rgb[2]);
+            }
+        } else {
+            for (w, rgb) in pairs {
+                w[rb] = rgb[0];
+                w[gb] = rgb[1];
+                w[bb] = rgb[2];
+            }
+        }
+    }
 }
 
 /// A rectangle to present, in screen coords.
@@ -88,11 +134,14 @@ pub struct Framebuffer {
     /// Wire bytes per pixel for `depth`, from `pixmap_formats`: 1 on depth-8,
     /// 4 on depth-24/32.
     bytes_per_pixel: usize,
+    /// Wire bytes per scanline: [`wire_stride`] over `xres` and the format's
+    /// `scanline_pad`.
+    wire_stride: usize,
     /// R, G, B offsets within a `bytes_per_pixel`-wide wire pixel. Depth-24
     /// little-endian BGRX is `[2, 1, 0]`. Unused on depth-8.
     chan: [usize; 3],
     pub var: Var,
-    /// Packed RGB ([`CH`] bytes/pixel), stride `xres * CH`. Every draw writes here.
+    /// Packed RGB ([`CH`] bytes/pixel), stride `xres * CH`.
     backing: Vec<u8>,
     /// Per-`PutImage` byte budget (server max request length minus header slack).
     max_req_bytes: usize,
@@ -106,19 +155,23 @@ impl Framebuffer {
         let xres = screen.width_in_pixels as u32;
         let yres = screen.height_in_pixels as u32;
         let depth = screen.root_depth;
-        // Depth 8 → 1; depth 24/32 → 4, X padding 24-bit pixels to 32.
-        let bytes_per_pixel = conn
+        // Depth 8 -> 1; depth 24 and 32 -> 4.
+        let format = conn
             .setup()
             .pixmap_formats
             .iter()
-            .find(|f| f.depth == depth)
+            .find(|f| f.depth == depth);
+        let bytes_per_pixel = format
             .map(|f| (f.bits_per_pixel as usize / 8).max(1))
             .unwrap_or(1);
-        // BGRX little-endian is the lab126 depth-24 fallback layout.
+        // `scanline_pad` is 32 bits on every standard format.
+        let scanline_pad = format.map(|f| f.scanline_pad as usize / 8).unwrap_or(4);
+        let wire_stride = wire_stride(xres as usize * bytes_per_pixel, scanline_pad);
+        // `[2, 1, 0]` is BGRX little-endian, the lab126 depth-24 layout.
         let chan = wire_channels(&conn, &screen, bytes_per_pixel).unwrap_or([2, 1, 0]);
-        // stderr, which `Steb.sh` appends to its log.
         eprintln!(
             "fb: xres={xres} yres={yres} depth={depth} bytes_per_pixel={bytes_per_pixel} \
+             scanline_pad={scanline_pad} wire_stride={wire_stride} \
              chan=[{},{},{}] root_visual=0x{:x}",
             chan[0], chan[1], chan[2], screen.root_visual,
         );
@@ -135,14 +188,14 @@ impl Framebuffer {
             0,
             WindowClass::INPUT_OUTPUT,
             screen.root_visual,
-            // No `backing_store`: it costs panel refreshes on this hardware.
+            // `CreateWindowAux` sets no `backing_store`.
             &CreateWindowAux::new()
                 .background_pixel(screen.white_pixel)
                 .event_mask(EventMask::EXPOSURE),
         )
         .context("create_window")?;
 
-        // The lab126 WM reads `WM_NAME` as a layout spec.
+        // `WM_NAME` carries the lab126 WM's layout spec.
         let name = b"L:A_N:application_ID:com.steb.picker_PC:N_O:U";
         conn.change_property8(
             PropMode::REPLACE,
@@ -160,7 +213,7 @@ impl Framebuffer {
             .context("create_gc")?;
         conn.flush().context("flush after map")?;
 
-        // The granted geometry against the requested `xres` / `yres`.
+        // `get_geometry` against the requested `xres` / `yres`.
         match conn
             .get_geometry(win)
             .map_err(|e| e.to_string())
@@ -188,7 +241,7 @@ impl Framebuffer {
         eprintln!(
             "fb: max request {} bytes ({} rows/band at {} bpp)",
             max_req_bytes,
-            max_req_bytes / (xres as usize * bytes_per_pixel).max(1),
+            max_req_bytes / wire_stride.max(1),
             bytes_per_pixel
         );
 
@@ -200,6 +253,7 @@ impl Framebuffer {
             gc,
             depth,
             bytes_per_pixel,
+            wire_stride,
             chan,
             var: Var { xres, yres },
             backing,
@@ -207,13 +261,13 @@ impl Framebuffer {
         })
     }
 
-    /// A gray pixel (0=black, 255=white) stored as `(v,v,v)`. Out-of-range no-ops.
+    /// A gray pixel (0=black, 255=white) stored as `(v,v,v)`, no-op out of range.
     #[inline]
     pub fn put_pixel(&mut self, x: i32, y: i32, value: u8) {
         self.put_pixel_rgb(x, y, [value, value, value]);
     }
 
-    /// An `[r, g, b]` pixel, for cover art. Out-of-range no-ops.
+    /// An `[r, g, b]` pixel, for cover art, no-op out of range.
     #[inline]
     pub fn put_pixel_rgb(&mut self, x: i32, y: i32, rgb: [u8; 3]) {
         if x < 0 || y < 0 || x >= self.var.xres as i32 || y >= self.var.yres as i32 {
@@ -251,7 +305,7 @@ impl Framebuffer {
             match event {
                 Event::Expose(_) => needs_repaint = true,
                 Event::Error(e) => {
-                    // An error counts as damage: the panel holds a stale frame.
+                    // `Event::Error` sets `needs_repaint`.
                     eprintln!("x11: WARNING request failed: {e:?}");
                     needs_repaint = true;
                 }
@@ -267,14 +321,13 @@ impl Framebuffer {
         let bpp = self.bytes_per_pixel;
         let xres = self.var.xres as usize;
         let bk_stride = xres * CH; // backing bytes per scanline (RGB)
-        let wire_stride = xres * bpp; // wire bytes per scanline
+        let wire_stride = self.wire_stride; // wire bytes per scanline, padded
         let width = self.var.xres as u16;
         let top = rect.top.min(self.var.yres);
         let bottom = rect.top.saturating_add(rect.height).min(self.var.yres);
         let max_rows = (self.max_req_bytes.saturating_sub(64) / wire_stride.max(1)).max(1);
-        let [rb, gb, bb] = self.chan;
 
-        // Reused across bands. Pad bytes stay at the 0xFF fill.
+        // `wire` is reused across bands.
         let mut wire: Vec<u8> = Vec::new();
 
         let mut y = top;
@@ -282,26 +335,14 @@ impl Framebuffer {
             let h = ((bottom - y) as usize).min(max_rows);
             let s = y as usize * bk_stride;
             let e = s + h * bk_stride;
-            let band = &self.backing[s..e];
-            let px = h * xres;
-
-            wire.clear();
-            wire.resize(px * bpp, 0xFF);
-            // `bpp == 1` collapses to one luma byte; wider scatters R/G/B to
-            // [`Framebuffer::chan`].
-            let (triples, _) = band.as_chunks::<CH>();
-            let pairs = wire.chunks_exact_mut(bpp).zip(triples);
-            if bpp == 1 {
-                for (w, src) in pairs {
-                    w[0] = luma(src[0], src[1], src[2]);
-                }
-            } else {
-                for (w, src) in pairs {
-                    w[rb] = src[0];
-                    w[gb] = src[1];
-                    w[bb] = src[2];
-                }
-            }
+            pack_band(
+                &mut wire,
+                &self.backing[s..e],
+                xres,
+                bpp,
+                wire_stride,
+                self.chan,
+            );
 
             self.conn
                 .put_image(
@@ -319,8 +360,8 @@ impl Framebuffer {
                 .context("put_image")?;
             y += h as u32;
         }
-        // A round-trip, past `flush`: the reply marks the batch processed and
-        // delivers any error it raised.
+        // `get_input_focus` round-trips past `flush`; its `reply` marks the batch
+        // processed and delivers any error the batch raised.
         self.conn
             .get_input_focus()
             .context("sync round-trip")?
@@ -334,7 +375,7 @@ impl Framebuffer {
         self.backing.clone()
     }
 
-    /// A [`Framebuffer::snapshot`] back into the backing. A size mismatch no-ops.
+    /// A [`Framebuffer::snapshot`] back into the backing, no-op on a size mismatch.
     /// [`Framebuffer::send_update`] presents it.
     pub fn restore_backing(&mut self, snap: Vec<u8>) {
         if snap.len() == self.backing.len() {
@@ -354,8 +395,70 @@ impl Framebuffer {
 
 impl Drop for Framebuffer {
     fn drop(&mut self) {
-        // The WM recomposites the screen under a destroyed window.
+        // `destroy_window` hands the screen back to the WM.
         let _ = self.conn.destroy_window(self.win);
         let _ = self.conn.flush();
+    }
+}
+
+#[cfg(test)]
+mod scanline_tests {
+    use super::{pack_band, wire_stride};
+
+    /// `wire_stride` over the shipped panel widths at both `bytes_per_pixel` a
+    /// Kindle X server offers, under a 4-byte pad.
+    #[test]
+    fn a_scanline_reaches_the_pad() {
+        // 758 is the one width that is not itself a multiple of the pad.
+        for (width, bpp, stride) in [
+            (600, 1, 600),
+            (758, 1, 760),
+            (1072, 1, 1072),
+            (1236, 1, 1236),
+            (1264, 1, 1264),
+            (1860, 1, 1860),
+            (758, 4, 3032),
+            (1272, 4, 5088),
+            (1860, 4, 7440),
+        ] {
+            assert_eq!(wire_stride(width * bpp, 4), stride, "{width} at {bpp} bpp");
+            assert_eq!(wire_stride(width * bpp, 4) % 4, 0);
+        }
+    }
+
+    /// `pad` of 0 answers `pixel_bytes`.
+    #[test]
+    fn a_pad_of_zero_is_one_byte() {
+        assert_eq!(wire_stride(758, 0), 758);
+    }
+
+    /// `pack_band` writes four bytes a row for three pixels at 1 bpp, the
+    /// fourth left at the 0xFF pad.
+    #[test]
+    fn a_short_row_keeps_its_pad() {
+        #[rustfmt::skip]
+        let band: Vec<u8> = vec![
+            0, 0, 0,  255, 255, 255,  128, 128, 128,
+            255, 0, 0,  0, 255, 0,  0, 0, 255,
+        ];
+        let mut wire = Vec::new();
+        pack_band(&mut wire, &band, 3, 1, 4, [2, 1, 0]);
+        assert_eq!(wire, [0, 255, 128, 0xFF, 76, 149, 28, 0xFF]);
+    }
+
+    /// `pack_band` scatters to `chan` at 4 bpp, leaving the fourth byte at 0xFF.
+    #[test]
+    fn a_wide_pixel_scatters_to_its_channels() {
+        let mut wire = Vec::new();
+        pack_band(&mut wire, &[10, 20, 30], 1, 4, 4, [2, 1, 0]);
+        assert_eq!(wire, [30, 20, 10, 0xFF]);
+    }
+
+    /// `pack_band` answers an empty `wire` for an `xres` of 0.
+    #[test]
+    fn no_columns_packs_nothing() {
+        let mut wire = vec![1, 2, 3];
+        pack_band(&mut wire, &[], 0, 1, 4, [2, 1, 0]);
+        assert!(wire.is_empty());
     }
 }
