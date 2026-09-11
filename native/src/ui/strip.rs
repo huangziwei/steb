@@ -26,8 +26,15 @@ pub fn top(fb_xres: u32, fb_yres: u32) -> u32 {
 
 /// The rule and the white body, answering the top edge the caller draws from.
 pub fn base(fb: &mut Framebuffer) -> u32 {
-    let (xres, yres) = (fb.var.xres, fb.var.yres);
-    let (top, rule) = (top(xres, yres), Scale::of_width(xres).px(RULE));
+    let top = top(fb.var.xres, fb.var.yres);
+    base_at(fb, top)
+}
+
+/// [`base`] at a top edge the caller names, for a bar standing clear of the
+/// screen's foot: the search overlay's sits on the on-screen keyboard.
+pub fn base_at(fb: &mut Framebuffer, top: u32) -> u32 {
+    let xres = fb.var.xres;
+    let rule = Scale::of_width(xres).px(RULE);
     fb.fill_rect(top, 0, xres, rule, BLACK);
     fb.fill_rect(top + rule, 0, xres, h(xres).saturating_sub(rule), WHITE);
     top
@@ -43,14 +50,20 @@ pub fn baseline(fb_xres: u32, top: u32, renderer: &TextRenderer) -> i32 {
 /// A separator at `x`, dividing the slot left of it from the one right of it.
 /// An `x` on either edge draws nothing: a bar does not open or close on a rule.
 pub fn separator(fb: &mut Framebuffer, x: u32) {
-    let (xres, yres) = (fb.var.xres, fb.var.yres);
+    let top = top(fb.var.xres, fb.var.yres);
+    separator_at(fb, top, x);
+}
+
+/// [`separator`] on the bar [`base_at`] drew at `top`.
+pub fn separator_at(fb: &mut Framebuffer, top: u32, x: u32) {
+    let xres = fb.var.xres;
     let s = Scale::of_width(xres);
     let (rule, inset) = (s.px(RULE), s.px(SEP_INSET));
     if x < rule || x >= xres {
         return;
     }
     fb.fill_rect(
-        top(xres, yres) + inset,
+        top + inset,
         x - rule,
         rule,
         h(xres).saturating_sub(inset * 2),

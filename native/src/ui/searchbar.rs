@@ -1,5 +1,5 @@
-//! The search bar: one widget at one geometry, drawn in the grid view and the
-//! `keyboard` overlay alike.
+//! The search bar: one widget at one geometry, drawn in the grid view and in
+//! the [`crate::ui::search`] overlay alike.
 
 use crate::eink::fb::Framebuffer;
 use crate::ui::grid;
@@ -19,6 +19,8 @@ const GLYPH_GAP: u32 = 24;
 const CLEAR_R: u32 = 15;
 /// Pill stroke thickness.
 const STROKE: u32 = 3;
+/// Gap between the typed text and the caret after it.
+const CARET_GAP: u32 = 8;
 /// Gap between the bar and the top of the grid.
 const GRID_GAP: u32 = 16;
 
@@ -58,7 +60,7 @@ pub fn field_w(xres: u32) -> u32 {
 
 /// A tap on the bar.
 pub enum Tap {
-    /// The field, opening `keyboard`.
+    /// The field, opening [`crate::ui::search`].
     Open,
     /// The `✕` zone, clearing the query.
     Clear,
@@ -84,6 +86,30 @@ pub fn hit(tx: u32, ty: u32, xres: u32, query_active: bool) -> Option<Tap> {
 /// A rounded pill, a magnifier glyph, the placeholder or query, and an `✕`
 /// under a set query.
 pub fn draw(fb: &mut Framebuffer, renderer: &mut TextRenderer, query: &str) {
+    render(fb, renderer, query, "", false);
+}
+
+/// [`draw`] with what an IME is composing drawn after `query`, underlined, and
+/// a caret at the end of the two. The overlay in [`crate::ui::search`] draws
+/// through this; nothing matches a query against the `preedit`.
+pub fn draw_composing(
+    fb: &mut Framebuffer,
+    renderer: &mut TextRenderer,
+    query: &str,
+    preedit: &str,
+) {
+    render(fb, renderer, query, preedit, true);
+}
+
+/// The bar itself. `caret` marks the field the keyboard is typing into; the
+/// grid's copy of the bar is not one.
+fn render(
+    fb: &mut Framebuffer,
+    renderer: &mut TextRenderer,
+    query: &str,
+    preedit: &str,
+    caret: bool,
+) {
     let xres = fb.var.xres;
     let s = Scale::of_width(xres);
     let (top, height) = (top(xres), height(xres));
@@ -108,7 +134,7 @@ pub fn draw(fb: &mut Framebuffer, renderer: &mut TextRenderer, query: &str) {
     grid::draw_magnifier(fb, mcx, cy, mr, 0x00);
     let text_x = mcx + mr as i32 + s.i(GLYPH_GAP as i32);
 
-    if query.trim().is_empty() {
+    if query.trim().is_empty() && preedit.is_empty() {
         // The two fields SE matches a query against.
         renderer.draw(fb, text_x, baseline, "Search title or author", false);
         return;
@@ -117,8 +143,32 @@ pub fn draw(fb: &mut Framebuffer, renderer: &mut TextRenderer, query: &str) {
     let clear_w = clear_w(xres);
     let right_limit = (x + w).saturating_sub(clear_w) as i32;
     let avail = (right_limit - text_x).max(0) as u32;
-    let shown = clamp_tail(renderer, query, avail);
+    let shown = clamp_tail(renderer, &format!("{query}{preedit}"), avail);
+    let shown_w = renderer.measure_width(&shown) as i32;
     renderer.draw(fb, text_x, baseline, &shown, false);
+    if !preedit.is_empty() {
+        // The composing tail carries a rule under it, as the framework's own
+        // fields draw one.
+        let under = renderer.measure_width(preedit).min(shown_w as u32);
+        let rule = s.px(STROKE);
+        fb.fill_rect(
+            (baseline + rule as i32 * 2).max(0) as u32,
+            (text_x + shown_w - under as i32).max(0) as u32,
+            under,
+            rule,
+            0x00,
+        );
+    }
+    if caret {
+        let caret_h = height / 2;
+        fb.fill_rect(
+            (cy - caret_h as i32 / 2).max(0) as u32,
+            (text_x + shown_w + s.i(CARET_GAP as i32)).max(0) as u32,
+            s.px(STROKE),
+            caret_h,
+            0x00,
+        );
+    }
     let clear_cx = (x + w).saturating_sub(clear_w / 2) as i32;
     grid::draw_x(fb, clear_cx, cy, s.i(CLEAR_R as i32), 0x00);
 }

@@ -31,8 +31,7 @@ const INPUT_PROP_DIRECT: u32 = 1;
 const EVENT_BYTES: usize = 16;
 
 /// Side of the square corner zones for the two-finger screenshot gesture, in
-/// user-visible pixels. ~14% of the KOA2's 1264px width — clearly "a corner"
-/// without demanding pixel precision.
+/// user-visible pixels.
 const SCREENSHOT_CORNER_PX: u32 = 180;
 
 /// Boundary touch events reaching the main loop: `Down` on a landing contact,
@@ -101,6 +100,8 @@ pub struct Touch {
     exclusive: bool,
     /// [`Touch::set_covered`]'s state: no grab, no [`Touch::next_event`].
     covered: bool,
+    /// [`Touch::set_keyboard`]'s state: no grab.
+    keyboard: bool,
     /// The orientation the framebuffer was opened with. Raw touch coords
     /// mirror by the same amount, matching what the panel draws.
     orientation: Orientation,
@@ -119,13 +120,12 @@ impl Touch {
             .custom_flags(libc::O_NONBLOCK)
             .open(&path)
             .with_context(|| format!("open {}", path.display()))?;
-        // The kernel treats the arg as a "non-NULL = grab, NULL = ungrab"
-        // boolean (see drivers/input/evdev.c). Pass 1.
+        // The kernel reads the arg as a boolean: non-NULL grabs.
         let grab_res = unsafe { libc::ioctl(file.as_raw_fd(), EVIOCGRAB as _, 1) };
         let grabbed = grab_res == 0;
         // A failed grab leaves the device readable and non-exclusive: a swipe
         // reaches the stock home screen and the framework repaints over this
-        // window. Logged plainly.
+        // window.
         if grabbed {
             eprintln!("touch: EVIOCGRAB ok — exclusive");
         } else {
@@ -136,8 +136,6 @@ impl Touch {
                 path.display()
             );
         }
-        // One line of what the reader resolved to. The node and the grab are
-        // the same on every launch of one build on one device.
         let said = format!(
             "touch={} grab={}",
             path.display(),
@@ -163,6 +161,7 @@ impl Touch {
             grabbed,
             exclusive: grabbed,
             covered: false,
+            keyboard: false,
             orientation,
             fb_xres,
             fb_yres,
@@ -204,16 +203,40 @@ impl Touch {
             return;
         }
         self.covered = covered;
-        let want = i32::from(!covered);
-        let ok = unsafe { libc::ioctl(self.file.as_raw_fd(), EVIOCGRAB as _, want) } == 0;
-        self.grabbed = ok && !covered;
-        eprintln!("touch: covered={covered} grabbed={}", self.grabbed);
+        self.apply_grab();
         self.forget_stroke();
+    }
+
+    /// Drops `EVIOCGRAB` and sets `keyboard`, taking the grab back on
+    /// `false`. Ungrabbed, [`Touch::next_event`] answers keyboard touches.
+    pub fn set_keyboard(&mut self, up: bool) {
+        if up == self.keyboard {
+            return;
+        }
+        self.keyboard = up;
+        self.apply_grab();
+        self.forget_stroke();
+    }
+
+    /// Holds `EVIOCGRAB` while `exclusive` and neither `covered` nor
+    /// `keyboard`.
+    fn apply_grab(&mut self) {
+        let want = self.exclusive && !self.covered && !self.keyboard;
+        if want == self.grabbed {
+            return;
+        }
+        let ok =
+            unsafe { libc::ioctl(self.file.as_raw_fd(), EVIOCGRAB as _, i32::from(want)) } == 0;
+        self.grabbed = ok && want;
+        eprintln!(
+            "touch: covered={} keyboard={} grabbed={} ioctl={ok}",
+            self.covered, self.keyboard, self.grabbed
+        );
     }
 
     /// Retakes `EVIOCGRAB` where `exclusive` holds and `grabbed` does not.
     pub fn retake(&mut self) {
-        if self.grabbed || self.covered || !self.exclusive {
+        if self.grabbed || self.covered || self.keyboard || !self.exclusive {
             return;
         }
         self.grabbed = unsafe { libc::ioctl(self.file.as_raw_fd(), EVIOCGRAB as _, 1) } == 0;
@@ -505,9 +528,7 @@ fn pick_from_devices(raw: &str) -> Option<String> {
         eprintln!("touch: using /dev/input/{node} (name={name:?}, score={score})");
         return Some(node);
     }
-    // Nothing else qualified, so a pen-named node is better than no input at
-    // all — a device with an unusable picker is worse than one driven by the
-    // wrong digitizer, and the log says plainly which happened.
+    // Nothing else qualified: a pen node is better than no input at all.
     let (node, name) = pen_fallback?;
     eprintln!("touch: using /dev/input/{node} (name={name:?}) — pen-named, but the only candidate");
     Some(node)

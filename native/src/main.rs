@@ -1,5 +1,5 @@
 //! Steb — search Standard Ebooks from the Kindle and download the `.azw3`. One
-//! paginated cover grid; `keyboard`, `filtermenu` and `sortmenu` open as
+//! paginated cover grid; `search`, `filtermenu` and `sortmenu` open as
 //! blocking sub-loops. A held cover downloads, then `convert` writes a `.kfx`.
 
 // This crate root compiles the same files as `lib.rs`, where the preview and
@@ -11,6 +11,8 @@ mod convert;
 mod cover_cache;
 mod eink;
 mod font;
+mod keyboard;
+mod lipc;
 mod net;
 mod orientation;
 mod se;
@@ -32,7 +34,7 @@ use ui::filter::Filters;
 use ui::scale::Scale;
 use ui::sort::SortState;
 use ui::text::TextRenderer;
-use ui::{diag, filtermenu, grid, keyboard, pager, searchbar, toast};
+use ui::{diag, filtermenu, grid, pager, search, searchbar, toast};
 
 /// Extension bundle root, holding `crate::cache`.
 const BUNDLE_DIR: &str = "/mnt/us/extensions/steb";
@@ -59,9 +61,8 @@ fn layout_for(fb: &Framebuffer) -> grid::Layout {
 /// How long a cover must be held, within [`ARM_SLOP_PX`], before its download
 /// arms and fires. A tap downloads nothing.
 const ARM_THRESHOLD: Duration = Duration::from_millis(1000);
-/// Max drift, either axis, across a hold. A design pixel: unscaled it is a much
-/// larger share of a 600 px panel than of a 1264 px one, and a hold there
-/// becomes near-impossible to cancel by drifting.
+/// Max drift, either axis, across a hold. A design pixel, so the slop is the
+/// same physical distance on every panel.
 const ARM_SLOP_PX: u32 = 40;
 
 /// [`ARM_SLOP_PX`] on a panel `fb_xres` wide.
@@ -295,7 +296,7 @@ fn draw_page(
     let end = (start + layout.page_size()).min(view.hits.len());
 
     if view.hits.is_empty() {
-        // Zero hits under a query names the query and points at `keyboard`.
+        // Zero hits under a query names the query and points at `search`.
         let lh = renderer.line_height().max(1);
         let msg = if view.has_query() {
             format!("No books match \u{201c}{}\u{201d}", view.query)
@@ -558,8 +559,6 @@ fn run() -> anyhow::Result<()> {
     };
     let mut input = Input::new(touch, buttons);
     input.set_orientation(orient);
-    // The same on every launch of one build on one device: a header line, not
-    // something the body should repeat.
     log(format!("surface: {}", fb.describe()));
     log(format!(
         "input: {} orientation={orient:?}",
@@ -685,6 +684,9 @@ fn run() -> anyhow::Result<()> {
     let mut down_pos: Option<(u32, u32)> = None;
 
     loop {
+        // An `Expose` lands on the X connection, which is no input device: the
+        // `Tick` that drains it should not wait out the idle timeout.
+        input.watch([fb.raw_fd(), None]);
         // A deadline at the arm instant. Finger micro-jitter keeps `poll` busy
         // through a hold, and no `Tick` arrives on its own.
         let deadline = armed.as_ref().map(|a| a.down_at + ARM_THRESHOLD);
@@ -737,7 +739,7 @@ fn run() -> anyhow::Result<()> {
                             repaint!();
                         }
                         searchbar::Tap::Open => {
-                            let q = keyboard::run(&mut fb, &mut input, &mut renderer, &view.query)?;
+                            let q = search::run(&mut fb, &mut input, &mut renderer, &view.query)?;
                             if q != view.query {
                                 view.query = q;
                                 view.clear_results();

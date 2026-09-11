@@ -10,9 +10,8 @@ use std::time::{Duration, Instant};
 /// The bokai binary [`locate`] probes.
 pub const BIN_PATH: &str = "/mnt/us/extensions/bokai/bin/bokai";
 
-/// How long [`Converter::convert_watched`] leaves between `try_wait` calls.
-/// Short enough that a cover arriving over this app is noticed promptly,
-/// long enough that the poll costs nothing against a minutes-long convert.
+/// How long [`Converter::convert_watched`] leaves between `try_wait` calls:
+/// short enough that a cover arriving over this app is noticed promptly.
 const POLL: Duration = Duration::from_millis(200);
 
 /// Extension of [`Converter::convert`]'s output.

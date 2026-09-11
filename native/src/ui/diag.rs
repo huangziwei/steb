@@ -150,7 +150,7 @@ pub fn run(
                     return Ok(action);
                 }
             }
-            // Finger-down: no press feedback for v1 (keep it minimal).
+            // Finger-down: no press feedback here.
             InputEvent::Touch(TouchEvent::Down { .. }) => {}
             InputEvent::Touch(TouchEvent::Screenshot) => {
                 let _ = crate::eink::screenshot::capture(fb);

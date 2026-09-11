@@ -174,9 +174,8 @@ fn find_button_device() -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-/// What the bezel resolved to, for the log's header block. A model with no
-/// page buttons is the common case and says so plainly: it is a fact about the
-/// device, not something the reader can act on.
+/// What the bezel resolved to, for the log's header block. Most models have
+/// no page buttons.
 pub fn describe(held: Option<&Buttons>) -> String {
     match held {
         None => "buttons=none".to_string(),
@@ -195,9 +194,8 @@ pub fn describe(held: Option<&Buttons>) -> String {
 mod tests {
     use super::describe;
 
-    /// Most models have no page buttons. That is a fact about the device, not
-    /// a fault the reader can act on, so it is a word in the header block and
-    /// never a line in the body.
+    /// A model with no page buttons is a word in the header block, never a
+    /// line in the body.
     #[test]
     fn a_model_with_no_page_buttons_says_so_as_a_fact() {
         assert_eq!(describe(None), "buttons=none");

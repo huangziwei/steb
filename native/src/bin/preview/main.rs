@@ -15,7 +15,7 @@ use steb_native::ui::filter::Filters;
 use steb_native::ui::scale::Scale;
 use steb_native::ui::sort::SortState;
 use steb_native::ui::text::TextRenderer;
-use steb_native::ui::{diag, filtermenu, grid, keyboard, pager, searchbar, sortmenu, toast};
+use steb_native::ui::{diag, filtermenu, grid, pager, search, searchbar, sortmenu, toast};
 
 /// `main::FONT_PX`: the body size as a design pixel, which `ui::scale` maps to
 /// each panel the way the app does.
@@ -49,8 +49,9 @@ const SHOTS: &[&str] = &[
     "toolbar:filtered",
     "searchbar:empty",
     "searchbar:query",
-    "keyboard:empty",
-    "keyboard:typed",
+    "search:empty",
+    "search:typed",
+    "search:composing",
     "filtermenu",
     "filtermenu:selected",
     "sortmenu",
@@ -189,8 +190,9 @@ fn draw(fb: &mut Framebuffer, renderer: &mut TextRenderer, shot: &str) -> Result
         "toolbar:filtered" => pager::draw(fb, renderer, 0, 4, 3),
         "searchbar:empty" => searchbar::draw(fb, renderer, ""),
         "searchbar:query" => searchbar::draw(fb, renderer, "the time machine"),
-        "keyboard:empty" => keyboard::render_screen(fb, renderer, ""),
-        "keyboard:typed" => keyboard::render_screen(fb, renderer, "middlemarch"),
+        "search:empty" => search::render_screen(fb, renderer, "", ""),
+        "search:typed" => search::render_screen(fb, renderer, "middlemarch", ""),
+        "search:composing" => search::render_screen(fb, renderer, "中", "guo"),
         "filtermenu" => {
             let tags = tags();
             filtermenu::render_screen(fb, renderer, &tags, &Filters::default(), 0);

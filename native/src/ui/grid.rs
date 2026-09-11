@@ -33,9 +33,8 @@ pub const CELL_H_MIN: u32 = 400;
 pub const COL_GAP: u32 = 32;
 pub const ROW_GAP: u32 = 20;
 
-/// The page no panel goes below, whatever the cover size costs. Without it a
-/// 6" panel holds two of each, and four covers a page is a lot of paging. A
-/// panel already holding the target keeps its cover size.
+/// The page no panel goes below, whatever the cover size costs. A panel
+/// already holding the target keeps its cover size.
 const TARGET_COLS: usize = 3;
 const TARGET_ROWS: usize = 3;
 
@@ -750,9 +749,8 @@ mod tests {
     use crate::ui::pager::strip_h;
     use crate::ui::searchbar::margin as top_margin;
 
-    /// The 7" panels take 3×3 at the full cell height. Both geometries are
-    /// checked: a Colorsoft reports 1272×1696, and a rule holding for
-    /// 1264×1680 alone holds for no real device.
+    /// The 7" panels take 3×3 at the full cell height, at both geometries the
+    /// fleet reports: the Colorsoft's 1272×1696 and the Oasis's 1264×1680.
     #[test]
     fn seven_inch_panels_are_unchanged() {
         for (w, h, expect_left) in [(1264u32, 1680u32, 60i32), (1272, 1696, 64)] {

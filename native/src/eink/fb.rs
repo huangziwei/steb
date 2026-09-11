@@ -13,7 +13,7 @@ use x11rb::connection::RequestConnection as _;
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, ConnectionExt, CreateGCAux, CreateWindowAux, EventMask, Gcontext, ImageFormat,
-    ImageOrder, PropMode, Screen, Visibility, Window, WindowClass,
+    ImageOrder, KeyButMask, PropMode, Screen, Visibility, Window, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
 // `change_property8` lives in the wrapper `ConnectionExt`.
@@ -98,6 +98,20 @@ fn fold(events: &[Event], screensaver: Atom, covered: bool, size: (u32, u32)) ->
     pump
 }
 
+/// The keysym `keycode` carries under `state`. `get_keyboard_mapping` runs
+/// once per press: keycodes 220 to 254 are rewritten between them.
+fn keysym_of(conn: &RustConnection, keycode: u8, state: u16) -> Option<u32> {
+    let reply = conn.get_keyboard_mapping(keycode, 1).ok()?.reply().ok()?;
+    // A keycode with one keysym has no shifted column.
+    let shifted = usize::from(state & u16::from(KeyButMask::SHIFT) != 0);
+    let at = shifted.min(reply.keysyms.len().saturating_sub(1));
+    let keysym = match reply.keysyms.get(at).copied().unwrap_or(0) {
+        0 => reply.keysyms.first().copied().unwrap_or(0),
+        keysym => keysym,
+    };
+    (keysym != 0).then_some(keysym)
+}
+
 /// `pixel_bytes` rounded up to a multiple of `pad`, the bytes `put_image` takes
 /// per ZPixmap scanline.
 fn wire_stride(pixel_bytes: usize, pad: usize) -> usize {
@@ -162,7 +176,7 @@ pub struct Var {
 }
 
 /// What [`Framebuffer::pump_events`] answers.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Pump {
     /// Set by `Expose` and by `Event::Error`.
     pub repaint: bool,
@@ -170,6 +184,8 @@ pub struct Pump {
     pub covered: Option<bool>,
     /// A `ConfigureNotify` size differing from the one being drawn.
     pub resized: Option<(u32, u32)>,
+    /// The keysym of every `KeyPress` drained, in order.
+    pub typed: Vec<u32>,
 }
 
 /// How long [`Framebuffer::open`] waits for `MapNotify`.
@@ -258,13 +274,15 @@ impl Framebuffer {
             // `CreateWindowAux` sets no `backing_store`.
             &CreateWindowAux::new()
                 .background_pixel(screen.white_pixel)
-                // `STRUCTURE_NOTIFY` carries `MapNotify` and `ConfigureNotify`;
-                // the WM lays this window out and may not hand it the root size.
-                // `VISIBILITY_CHANGE` reports a window put over this one.
+                // `STRUCTURE_NOTIFY` carries `MapNotify` and `ConfigureNotify`,
+                // `VISIBILITY_CHANGE` a window put over this one, and
+                // `KEY_PRESS` a `KeyPress` sent to the focused window.
                 .event_mask(
                     EventMask::EXPOSURE
                         | EventMask::VISIBILITY_CHANGE
-                        | EventMask::STRUCTURE_NOTIFY,
+                        | EventMask::STRUCTURE_NOTIFY
+                        | EventMask::KEY_PRESS
+                        | EventMask::KEY_RELEASE,
                 ),
         )
         .context("create_window")?;
@@ -323,12 +341,9 @@ impl Framebuffer {
         let wire_stride = wire_stride(xres as usize * bytes_per_pixel, scanline_pad);
 
         // `maximum_request_bytes` is the post-BIG-REQUESTS limit (~16 MB), past
-        // `setup().maximum_request_length`. A 1860×2480 frame is 4.6 MB: one
-        // request, uncapped.
+        // `setup().maximum_request_length`.
         let max_req_bytes = conn.maximum_request_bytes().max(4096);
 
-        // One line of everything the surface resolved to. Every part of it is
-        // the same on every launch of one build on one device.
         let said = format!(
             "{root_said} mapped={mapped} drawing {xres}x{yres} stride={wire_stride} \
              maxreq={max_req_bytes} ({} rows/band)",
@@ -368,6 +383,15 @@ impl Framebuffer {
             backing,
             said,
         })
+    }
+
+    /// `Surface::conn`'s descriptor, for `poll(2)`.
+    /// [`Framebuffer::pump_events`] drains what lands on it.
+    pub fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd;
+        self.surface
+            .as_ref()
+            .map(|surface| surface.conn.stream().as_raw_fd())
     }
 
     /// A white `xres` by `yres` surface with no server behind it: every draw
@@ -435,7 +459,14 @@ impl Framebuffer {
         while let Ok(Some(event)) = surface.conn.poll_for_event() {
             events.push(event);
         }
-        let pump = fold(&events, surface.screensaver, surface.covered, size);
+        let mut pump = fold(&events, surface.screensaver, surface.covered, size);
+        for event in &events {
+            if let Event::KeyPress(ev) = event
+                && let Some(keysym) = keysym_of(&surface.conn, ev.detail, ev.state.into())
+            {
+                pump.typed.push(keysym);
+            }
+        }
         if let Some(covered) = pump.covered {
             surface.covered = covered;
         }

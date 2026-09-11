@@ -11,7 +11,7 @@ use super::buttons::{Buttons, PageButton};
 use super::touch::{Touch, TouchEvent};
 use crate::orientation::Orientation;
 
-/// How long [`Input::next`] blocks before surfacing a `Tick`, bounding how
+/// How long [`Input::next_event`] blocks before surfacing a `Tick`, bounding
 /// quickly a device rotation reaches the main loop. Fires on an idle poll:
 /// real input returns first.
 const TICK_MS: libc::c_int = 500;
@@ -41,6 +41,9 @@ pub struct Input {
     checked: Option<Instant>,
     /// [`Input::set_covered`]'s state.
     covered: bool,
+    /// The descriptors to wake on beside the input devices, from
+    /// [`Input::watch`].
+    watched: [RawFd; 2],
 }
 
 impl Input {
@@ -51,6 +54,7 @@ impl Input {
             orientation: Orientation::Up,
             checked: None,
             covered: false,
+            watched: [-1; 2],
         }
     }
 
@@ -85,6 +89,19 @@ impl Input {
         if let Some(buttons) = self.buttons.as_mut() {
             buttons.set_covered(covered);
         }
+    }
+
+    /// [`Touch::set_keyboard`] over the touchscreen. The on-screen keyboard is
+    /// the framework's own window; a held grab would starve it.
+    pub fn set_keyboard(&mut self, up: bool) {
+        self.touch.set_keyboard(up);
+    }
+
+    /// Wake on `fds` as well as on the input devices, answering an
+    /// [`InputEvent::Tick`] where one is readable. The X connection and the
+    /// lipc socket are neither of them an input device.
+    pub fn watch(&mut self, fds: [Option<RawFd>; 2]) {
+        self.watched = fds.map(|fd| fd.unwrap_or(-1));
     }
 
     /// [`Touch::retake`] and [`Buttons::retake`] over both devices, for a grab
@@ -159,7 +176,7 @@ impl Input {
         if unsafe { libc::poll(fds.as_mut_ptr(), nfds, 0) } <= 0 {
             return Ok(None);
         }
-        // Touch first, past [`Input::next`]'s order: a stale `None` button read
+        // Touch first, past [`Input::next_event`]'s order: a stale `None` read
         // returns early and shadows a pending touch event.
         if fds[0].revents & libc::POLLIN != 0
             && let Some(ev) = self.touch.next_event()?
@@ -182,7 +199,7 @@ impl Input {
         self.next_deadline(None)
     }
 
-    /// [`Self::next`] with an [`InputEvent::Tick`] at `deadline`, past a busy
+    /// [`Self::next_event`] with an [`InputEvent::Tick`] at `deadline`, past a
     /// touch fd: the timeout is the remaining time to the absolute `deadline`,
     /// recomputed each iteration. `None` gives a plain [`TICK_MS`] idle tick.
     pub fn next_deadline(&mut self, deadline: Option<Instant>) -> Result<InputEvent> {
@@ -206,8 +223,19 @@ impl Input {
                     events: libc::POLLIN,
                     revents: 0,
                 },
+                libc::pollfd {
+                    fd: self.watched[0],
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self.watched[1],
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
             ];
-            let nfds: libc::nfds_t = if self.buttons.is_some() { 2 } else { 1 };
+            // A slot holding -1 is skipped by `poll`.
+            let nfds: libc::nfds_t = fds.len() as libc::nfds_t;
 
             // Remaining time to `deadline`, floored at 1ms against a sub-ms
             // spin, else [`TICK_MS`]. `poll` wakes early on fd readiness.
@@ -258,6 +286,11 @@ impl Input {
                     return Ok(InputEvent::Touch(ev));
                 }
                 continue;
+            }
+
+            // A `watched` slot is readable; the caller drains it.
+            if fds[2..].iter().any(|fd| fd.revents & libc::POLLIN != 0) {
+                return Ok(InputEvent::Tick);
             }
 
             // Spurious wake with no POLLIN — poll again.

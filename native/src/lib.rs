@@ -7,6 +7,8 @@ pub mod convert;
 pub mod cover_cache;
 pub mod eink;
 pub mod font;
+pub mod keyboard;
+pub mod lipc;
 pub mod net;
 pub mod orientation;
 pub mod se;

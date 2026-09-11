@@ -58,7 +58,7 @@ pub struct Candidate {
 ///
 /// Scanned by [`discover`]. A missing directory costs one failed `read_dir`.
 const FONT_DIRS: &[&str] = &[
-    // The firmware set, confirmed on-device.
+    // The firmware set.
     "/usr/java/lib/fonts",
     // Absent on this generation.
     "/usr/share/fonts",
@@ -360,8 +360,7 @@ impl FontChain {
 }
 
 /// Whether `font` can draw `ch` at all. Glyph 0 is `.notdef`, which is what a
-/// face hands back for a character it doesn't have — asking for it is how the
-/// tofu got drawn in the first place.
+/// face hands back for a character it does not have.
 pub fn has_glyph(font: &FontVec, ch: char) -> bool {
     font.glyph_id(ch).0 != 0
 }
@@ -455,8 +454,8 @@ mod tests {
         for c in ['\n', '\r', '\t', '\u{0}', '\u{7F}', '\u{85}'] {
             assert!(is_invisible(c), "{c:?} would draw as a box");
         }
-        // Nothing in the chain has one, which is the whole damage: the box got
-        // drawn, and the miss also pushed the rest of the run off its face.
+        // Nothing in the chain has one: the miss must not push the rest of
+        // the run off its face.
         let faces = ["Synced 3", "汉字"];
         assert_eq!(face_with('\n', unhinted(&faces), repertoires(&faces)), None);
         assert_eq!(
@@ -583,17 +582,16 @@ mod tests {
 
     #[test]
     fn language_classification_still_works_even_though_nothing_uses_it() {
-        // `Script::of_language` is pure and uncalled: Steb passes no language
-        // tags. `text.rs` and `grid.rs` take a `Script` in their signatures.
+        // Steb passes no language tags, but `text.rs` and `grid.rs` still
+        // take a `Script`.
         assert_eq!(Script::of_language("en"), Script::Unknown);
         assert_eq!(Script::of_language(""), Script::Unknown);
     }
 
     #[test]
     fn a_chain_with_no_readable_candidate_fails_to_load() {
-        // The one case that is fatal. Individually missing candidates are not
-        // (they are simply skipped), but that path needs a real font file and
-        // so is only exercised on the device.
+        // The one case that is fatal: a missing candidate is skipped, an
+        // empty chain is not.
         let nowhere = [Candidate {
             path: PathBuf::from("/nonexistent/font.ttf"),
             script: Script::Unknown,

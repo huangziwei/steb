@@ -28,9 +28,8 @@ enum Tap {
     Done,
 }
 
-/// Precomputed vertical geometry. Stable across KOA2's Up/Down (both portrait,
-/// same `xres`/`yres`), but recomputed on rotation anyway in case a future
-/// device reports different dims.
+/// Precomputed vertical geometry, recomputed on every rotation: the landscape
+/// pair changes the panel size.
 struct Layout {
     lh: u32,
     rows_top: u32,
