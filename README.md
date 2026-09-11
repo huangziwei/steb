@@ -17,7 +17,7 @@ Download and unzip the latest `steb-v<x.y.z>-kindle.zip` file from the [release 
 
 | from | to | notes |
 |:--|:--|:-- |
-| `extensions/steb/` | `/mnt/us/extensions/steb/` | or anywhere you store your extensions |
+| `extensions/steb/` | `/mnt/us/extensions/steb/` | hardcoded path, it has to be here |
 | `documents/Steb.sh` | `/mnt/us/documents/Steb.sh` | or anywhere you store your scriptlets |
 
 Either one launches Steb: the scriptlet as a tile in the library, the extension as a **Steb** entry in KUAL.
