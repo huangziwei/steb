@@ -6,6 +6,8 @@ use crate::eink::fb::{Framebuffer, MxcfbRect, WAVEFORM_MODE_GC16};
 use crate::eink::input::{Input, InputEvent};
 use crate::eink::touch::TouchEvent;
 use crate::se::http::Error as HttpError;
+use crate::ui::scale::Scale;
+use crate::ui::strip;
 use crate::ui::text::TextRenderer;
 
 /// What a tap on the Diagnostics screen resolved to.
@@ -16,20 +18,19 @@ pub enum Action {
     Exit,
 }
 
-/// Bottom button row height, over `pager`'s 80px strip: two wide zones.
-const BTN_H: u32 = 120;
 /// Left inset for the info block, bounding the wrapped Last and Hint rows.
-const MARGIN_X: u32 = 60;
+const MARGIN_X_PX: u32 = 60;
 
-fn btn_top(yres: u32) -> u32 {
-    yres.saturating_sub(BTN_H)
+/// Side margin on a panel `fb_xres` wide.
+fn margin_x(fb_xres: u32) -> u32 {
+    Scale::of_width(fb_xres).px(MARGIN_X_PX)
 }
 
 /// A tap mapped to a button. Above the button row is dead space; the row
 /// splits left `Exit`, right `Retry`, matching `pager`'s leftmost `Exit`. Pure
 /// integer geometry, like `pager::hit`.
 pub fn hit(tx: u32, ty: u32, xres: u32, yres: u32) -> Option<Action> {
-    if ty < btn_top(yres) {
+    if ty < strip::top(xres, yres) {
         return None;
     }
     if tx < xres / 2 {
@@ -61,15 +62,25 @@ fn draw_line(
     *y += lh;
 }
 
-/// White-fill the panel, paint the info block + button row, then a single
-/// full-screen GC16 refresh so the screen lands clean (no DU ghosting
-/// from whatever was there before).
+/// The screen as [`run`] draws it, without a device behind it.
+/// `crate::bin::preview` reads it back as a PNG.
+pub fn render_screen(
+    fb: &mut Framebuffer,
+    renderer: &mut TextRenderer,
+    err: &HttpError,
+) -> anyhow::Result<()> {
+    draw(fb, renderer, err)
+}
+
+/// The info block and button row over a white panel, presented in one
+/// full-screen GC16 so no DU ghosting survives.
 fn draw(fb: &mut Framebuffer, renderer: &mut TextRenderer, err: &HttpError) -> anyhow::Result<()> {
     fb.fill_rect(0, 0, fb.var.xres, fb.var.yres, 0xFF);
 
     let lh = renderer.line_height().max(1);
-    let left = MARGIN_X as i32;
-    let max_w = fb.var.xres.saturating_sub(MARGIN_X * 2);
+    let margin = margin_x(fb.var.xres);
+    let left = margin as i32;
+    let max_w = fb.var.xres.saturating_sub(margin * 2);
     let mut y = lh * 3; // a little headroom from the top edge
 
     draw_line(
@@ -110,30 +121,16 @@ fn draw(fb: &mut Framebuffer, renderer: &mut TextRenderer, err: &HttpError) -> a
     Ok(())
 }
 
-/// A two-zone button row: `[ Exit ]` left, `[ Retry ]` right, a 2px top divider
-/// and a vertical mid divider in `pager`'s style. Labels are bracketed ASCII,
-/// carrying no glyph-coverage risk.
+/// `[ Exit ]` left, `[ Retry ]` right. Labels are bracketed ASCII, carrying no
+/// glyph-coverage risk.
 fn draw_buttons(fb: &mut Framebuffer, renderer: &mut TextRenderer) {
     let xres = fb.var.xres;
-    let top = btn_top(fb.var.yres);
     let mid = xres / 2;
-
-    fb.fill_rect(top, 0, xres, 2, 0x00); // top divider
-    fb.fill_rect(top + 2, 0, xres, BTN_H - 2, 0xFF); // white body
-    fb.fill_rect(top + 12, mid.saturating_sub(1), 2, BTN_H - 24, 0x00); // mid divider
-
-    let baseline = (top + BTN_H * 60 / 100) as i32;
-    // Exit (leave) in the left half — leftmost, matching every other screen.
-    let exit = "[ Exit ]";
-    let ew = renderer.measure_width(exit);
-    let ex = ((mid as i32 - ew as i32) / 2).max(0);
-    renderer.draw(fb, ex, baseline, exit, false);
-
-    // Retry in the right half.
-    let retry = "[ Retry ]";
-    let rw = renderer.measure_width(retry);
-    let rx = (mid as i32 + (mid as i32 - rw as i32) / 2).max(mid as i32);
-    renderer.draw(fb, rx, baseline, retry, false);
+    let top = strip::base(fb);
+    let baseline = strip::baseline(xres, top, renderer);
+    strip::label(fb, renderer, 0, mid, baseline, "[ Exit ]", false);
+    strip::label(fb, renderer, mid, xres - mid, baseline, "[ Retry ]", false);
+    strip::separator(fb, mid);
 }
 
 /// The panel for `err`, blocking until a Retry or Exit tap. Called fresh per
@@ -146,7 +143,7 @@ pub fn run(
 ) -> anyhow::Result<Action> {
     draw(fb, renderer, err)?;
     loop {
-        match input.next()? {
+        match input.next_event()? {
             // Act on finger-up, like `pager`.
             InputEvent::Touch(TouchEvent::Up { x, y }) => {
                 if let Some(action) = hit(x, y, fb.var.xres, fb.var.yres) {

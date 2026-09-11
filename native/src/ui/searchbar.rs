@@ -3,18 +3,57 @@
 
 use crate::eink::fb::Framebuffer;
 use crate::ui::grid;
+use crate::ui::scale::Scale;
 use crate::ui::text::TextRenderer;
 
-/// Geometry, shared by every view drawing the bar.
-pub const TOP: u32 = 16;
-pub const HEIGHT: u32 = 88;
-pub const MARGIN_X: u32 = 40;
+/// Geometry, shared by every view drawing the bar. Design pixels; see
+/// [`crate::ui::scale`].
+const TOP_PX: u32 = 16;
+const HEIGHT_PX: u32 = 88;
+const MARGIN_X_PX: u32 = 40;
 /// Right-hand zone clearing the query, live under `query_active`.
-pub const CLEAR_W: u32 = 150;
+const CLEAR_W_PX: u32 = 150;
+/// Magnifier radius, the gap after it, and the `✕` radius.
+const GLYPH_R: u32 = 18;
+const GLYPH_GAP: u32 = 24;
+const CLEAR_R: u32 = 15;
+/// Pill stroke thickness.
+const STROKE: u32 = 3;
+/// Gap between the bar and the top of the grid.
+const GRID_GAP: u32 = 16;
+
+/// Bar top on a panel `fb_xres` wide.
+pub fn top(fb_xres: u32) -> u32 {
+    Scale::of_width(fb_xres).px(TOP_PX)
+}
+
+/// Bar height on a panel `fb_xres` wide.
+pub fn height(fb_xres: u32) -> u32 {
+    Scale::of_width(fb_xres).px(HEIGHT_PX)
+}
+
+/// Headroom the bar takes above the grid: its own top, height and the gap
+/// under it. `ui::grid` lays out against what is left below this.
+pub fn margin(fb_xres: u32) -> u32 {
+    top(fb_xres) + height(fb_xres) + Scale::of_width(fb_xres).px(GRID_GAP)
+}
+
+/// Side margin on a panel `fb_xres` wide.
+pub fn margin_x(fb_xres: u32) -> u32 {
+    Scale::of_width(fb_xres).px(MARGIN_X_PX)
+}
+
+/// Clear-zone width on a panel `fb_xres` wide, never more than a third of the
+/// field: a fixed zone swallows a narrow panel's whole query.
+fn clear_w(fb_xres: u32) -> u32 {
+    Scale::of_width(fb_xres)
+        .px(CLEAR_W_PX)
+        .min(field_w(fb_xres) / 3)
+}
 
 /// Search-field pill width: the full span between the side margins.
 pub fn field_w(xres: u32) -> u32 {
-    xres.saturating_sub(MARGIN_X * 2)
+    xres.saturating_sub(margin_x(xres) * 2)
 }
 
 /// A tap on the bar.
@@ -27,15 +66,16 @@ pub enum Tap {
 
 /// Hit-tests the bar. `query_active` enables the `✕` zone.
 pub fn hit(tx: u32, ty: u32, xres: u32, query_active: bool) -> Option<Tap> {
-    if !(TOP..TOP + HEIGHT).contains(&ty) {
+    let (top, height) = (top(xres), height(xres));
+    if !(top..top + height).contains(&ty) {
         return None;
     }
-    let x = MARGIN_X;
+    let x = margin_x(xres);
     let w = field_w(xres);
     if !(x..x + w).contains(&tx) {
         return None;
     }
-    if query_active && tx >= x + w - CLEAR_W {
+    if query_active && tx >= x + w - clear_w(xres) {
         return Some(Tap::Clear);
     }
     Some(Tap::Open)
@@ -45,17 +85,28 @@ pub fn hit(tx: u32, ty: u32, xres: u32, query_active: bool) -> Option<Tap> {
 /// under a set query.
 pub fn draw(fb: &mut Framebuffer, renderer: &mut TextRenderer, query: &str) {
     let xres = fb.var.xres;
-    let x = MARGIN_X;
+    let s = Scale::of_width(xres);
+    let (top, height) = (top(xres), height(xres));
+    let x = margin_x(xres);
     let w = field_w(xres);
-    let cy = (TOP + HEIGHT / 2) as i32;
-    let baseline = (TOP + HEIGHT * 62 / 100) as i32;
+    let cy = (top + height / 2) as i32;
+    let baseline = (top + height * 62 / 100) as i32;
 
     // Pill frame, magnifier inside the left rounded end.
-    grid::stroke_round_rect(fb, x as i32, TOP as i32, w, HEIGHT, HEIGHT / 2, 3, 0x00);
-    let mr = 18u32;
-    let mcx = (x + HEIGHT / 2 + 6) as i32;
+    grid::stroke_round_rect(
+        fb,
+        x as i32,
+        top as i32,
+        w,
+        height,
+        height / 2,
+        s.px(STROKE),
+        0x00,
+    );
+    let mr = s.px(GLYPH_R);
+    let mcx = (x + height / 2 + s.px(6)) as i32;
     grid::draw_magnifier(fb, mcx, cy, mr, 0x00);
-    let text_x = mcx + mr as i32 + 24;
+    let text_x = mcx + mr as i32 + s.i(GLYPH_GAP as i32);
 
     if query.trim().is_empty() {
         // The two fields SE matches a query against.
@@ -63,12 +114,13 @@ pub fn draw(fb: &mut Framebuffer, renderer: &mut TextRenderer, query: &str) {
         return;
     }
     // Query text, tail-first past the field width, and the clear button.
-    let right_limit = (x + w).saturating_sub(CLEAR_W) as i32;
+    let clear_w = clear_w(xres);
+    let right_limit = (x + w).saturating_sub(clear_w) as i32;
     let avail = (right_limit - text_x).max(0) as u32;
     let shown = clamp_tail(renderer, query, avail);
     renderer.draw(fb, text_x, baseline, &shown, false);
-    let clear_cx = (x + w).saturating_sub(CLEAR_W / 2) as i32;
-    grid::draw_x(fb, clear_cx, cy, 15, 0x00);
+    let clear_cx = (x + w).saturating_sub(clear_w / 2) as i32;
+    grid::draw_x(fb, clear_cx, cy, s.i(CLEAR_R as i32), 0x00);
 }
 
 /// The trailing substring of `s` fitting `max_width`.

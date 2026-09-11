@@ -2,6 +2,9 @@
 .DS_Store
 
 artifacts/
+# The one per-machine path ./preview.sh needs: where this host keeps a copy
+# of the device's /usr/java/lib/fonts.
+preview.env
 /target
 # What build.sh stages into the install tree. bin/steb.sh beside it is the
 # tracked launcher both the tile and the KUAL entry run.

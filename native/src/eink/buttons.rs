@@ -30,10 +30,16 @@ pub enum PageButton {
 }
 
 pub struct Buttons {
+    /// The node this reader took, for the log's header block.
+    node: String,
     file: File,
-    /// Whether `EVIOCGRAB` succeeded. A failed grab leaves the stock framework
+    /// Whether `EVIOCGRAB` is held. A failed grab leaves the stock framework
     /// reading presses too, and this device reading them all the same.
     grabbed: bool,
+    /// Whether [`Buttons::open`]'s `EVIOCGRAB` took. Read by [`Buttons::retake`].
+    exclusive: bool,
+    /// [`Buttons::set_covered`]'s state: no grab, no [`Buttons::read_one`].
+    covered: bool,
     /// Framework orientation, set by [`Buttons::set_orientation`]. `Down` swaps
     /// `Prev` and `Next`, holding "forward" under the same thumb.
     orientation: Orientation,
@@ -52,8 +58,11 @@ impl Buttons {
             .with_context(|| format!("open {}", path.display()))?;
         let grabbed = unsafe { libc::ioctl(file.as_raw_fd(), EVIOCGRAB as _, 1) } == 0;
         Ok(Some(Self {
+            node: path.display().to_string(),
             file,
             grabbed,
+            exclusive: grabbed,
+            covered: false,
             orientation: Orientation::Up,
         }))
     }
@@ -69,6 +78,31 @@ impl Buttons {
         self.orientation = orientation;
     }
 
+    /// Drops `EVIOCGRAB` and sets `covered` while another window covers this
+    /// app's; takes the grab back when that window goes. A held grab under the
+    /// passcode or the ads screen keeps the bezel keys from reaching them.
+    pub fn set_covered(&mut self, covered: bool) {
+        if covered == self.covered {
+            return;
+        }
+        self.covered = covered;
+        let want = i32::from(!covered);
+        let ok = unsafe { libc::ioctl(self.file.as_raw_fd(), EVIOCGRAB as _, want) } == 0;
+        self.grabbed = ok && !covered;
+        eprintln!("buttons: covered={covered} grabbed={}", self.grabbed);
+    }
+
+    /// Retakes `EVIOCGRAB` where `exclusive` holds and `grabbed` does not.
+    pub fn retake(&mut self) {
+        if self.grabbed || self.covered || !self.exclusive {
+            return;
+        }
+        self.grabbed = unsafe { libc::ioctl(self.file.as_raw_fd(), EVIOCGRAB as _, 1) } == 0;
+        if self.grabbed {
+            eprintln!("buttons: EVIOCGRAB retaken");
+        }
+    }
+
     /// One event record, the caller having polled first. `Some` on a mapped
     /// page key's press (`value==1`) alone; a release, autorepeat, `SYN` or
     /// unmapped key answers `None`.
@@ -80,11 +114,15 @@ impl Buttons {
         let type_ = u16::from_ne_bytes([buf[8], buf[9]]);
         let code = u16::from_ne_bytes([buf[10], buf[11]]);
         let value = i32::from_ne_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        // Covered: the record is read and dropped.
+        if self.covered {
+            return Ok(None);
+        }
         if type_ == EV_KEY && value == 1 {
             let btn = match code {
-                // KOA2, hardware-confirmed: the top button emits KEY_PAGEUP
-                // and the bottom KEY_PAGEDOWN. Top pages forward, inverting
-                // the keycodes' literal names.
+                // On the KOA2 the top button emits KEY_PAGEUP and the bottom
+                // KEY_PAGEDOWN, and top pages forward: the keycodes' literal
+                // names are inverted here.
                 KEY_PAGEUP => Some(PageButton::Next),
                 KEY_PAGEDOWN => Some(PageButton::Prev),
                 _ => None,
@@ -134,4 +172,34 @@ fn find_button_device() -> Result<Option<PathBuf>> {
         }
     }
     Ok(None)
+}
+
+/// What the bezel resolved to, for the log's header block. A model with no
+/// page buttons is the common case and says so plainly: it is a fact about the
+/// device, not something the reader can act on.
+pub fn describe(held: Option<&Buttons>) -> String {
+    match held {
+        None => "buttons=none".to_string(),
+        Some(buttons) => format!(
+            "buttons={} grab={}",
+            buttons.node,
+            match buttons.grabbed {
+                true => "ok",
+                false => "refused",
+            },
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::describe;
+
+    /// Most models have no page buttons. That is a fact about the device, not
+    /// a fault the reader can act on, so it is a word in the header block and
+    /// never a line in the body.
+    #[test]
+    fn a_model_with_no_page_buttons_says_so_as_a_fact() {
+        assert_eq!(describe(None), "buttons=none");
+    }
 }

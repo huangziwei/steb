@@ -1,12 +1,12 @@
 //! `--probe-x`: what could explain one panel refreshing and another not, in a
-//! form two devices diff against each other. The probes ask after the
-//! mechanism `crate::eink::fb` takes the X server for.
+//! form two devices diff against each other. [`run`] writes [`OUT_PATH`] and
+//! draws nothing the app would recognise.
 
 use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use x11rb::connection::{Connection, RequestConnection as _};
 use x11rb::protocol::xproto::{
     AtomEnum, BackingStore, ConnectionExt, CreateGCAux, CreateWindowAux, EventMask, ImageFormat,
@@ -762,14 +762,4 @@ fn probe_eink_paths(o: &mut String) {
             let _ = writeln!(o, "/proc/eink_fb/{}", e.file_name().to_string_lossy());
         }
     }
-}
-
-/// Best-effort `uname -a` etc. so one dump identifies its own device.
-pub fn device_line() -> String {
-    std::fs::read_to_string("/proc/version").unwrap_or_else(|_| "unknown".into())
-}
-
-pub fn run_logged() -> Result<()> {
-    println!("{}", device_line().trim());
-    run().context("x probe")
 }

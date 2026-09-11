@@ -13,6 +13,12 @@ path = "src/lib.rs"
 name = "steb-native"
 path = "src/main.rs"
 
+[[bin]]
+# Host-only: renders every screen to a PNG with no Kindle behind it. Never
+# shipped — `build.sh` names the binary above and copies that one alone.
+name = "preview"
+path = "src/bin/preview/main.rs"
+
 [dependencies]
 # Raw open/ioctl for the framebuffer and evdev touch/button devices.
 libc = "0.2"

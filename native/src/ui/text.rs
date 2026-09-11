@@ -48,10 +48,26 @@ impl TextRenderer {
             .join(" -> ")
     }
 
+    /// Runs `f` with the renderer set to `px`, restoring the size after. The
+    /// glyph cache is keyed by size, so a temporary change costs no redraw.
+    pub fn at_px<R>(&mut self, px: f32, f: impl FnOnce(&mut Self) -> R) -> R {
+        let previous = std::mem::replace(&mut self.px, px);
+        let out = f(self);
+        self.px = previous;
+        out
+    }
+
+    /// The baseline seating this size's ink centred in a `box_h`-tall box.
+    pub fn centred_baseline(&self, box_h: u32) -> i32 {
+        let face = self.chain.primary().as_scaled(self.px);
+        // `descent` is negative, so this is the ink's full height.
+        let (ascent, descent) = (face.ascent(), face.descent());
+        (((box_h as f32 - (ascent - descent)) / 2.0) + ascent).round() as i32
+    }
+
     pub fn line_height(&self) -> u32 {
-        // The face's own vertical metrics; round up so adjacent rows don't
-        // tear into each other. Always the primary face's, so a row keeps its
-        // height whichever face draws the text.
+        // Always the primary face's, so a row keeps its height whichever face
+        // draws the text. Rounded up, against rows tearing into each other.
         let face = self.chain.primary().as_scaled(self.px);
         (face.height() + face.line_gap()).ceil().max(1.0) as u32
     }
@@ -144,7 +160,6 @@ impl TextRenderer {
                 continue;
             }
             match self.chain.glyph_source(selection, ch) {
-                // Cache key uses bit pattern of f32 — same px always keys the same.
                 Some((face, font)) => {
                     let glyph = self
                         .cache
@@ -215,8 +230,8 @@ fn missing_advance(px: f32) -> u32 {
 }
 
 /// A hollow box standing on the baseline, for a character no face in the
-/// chain has. Stroked 2px on purpose: a hairline outline is exactly what
-/// makes a font's own `.notdef` fall apart under [`COVERAGE_THRESHOLD`].
+/// chain has. The stroke must clear [`COVERAGE_THRESHOLD`]: a hairline does
+/// not survive it.
 fn draw_missing(fb: &mut Framebuffer, x: i32, y_baseline: i32, px: f32, fg: u8) {
     const STROKE: i32 = 2;
     let (left, right) = (x + STROKE, x + missing_advance(px) as i32 - STROKE * 2);
@@ -247,8 +262,6 @@ fn blit_threshold(
     if w == 0 || h == 0 {
         return;
     }
-    // put_pixel applies the orientation transform + bounds check. Glyphs
-    // are small (≤32x32 typically), so per-pixel call overhead is fine.
     for row in 0..h {
         let cov_row = &coverage[row * w..row * w + w];
         for (col, &cov) in cov_row.iter().enumerate() {

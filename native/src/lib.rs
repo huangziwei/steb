@@ -1,14 +1,14 @@
-//! The modules with no `eink` dependency, built by `cargo test` on the host.
-//! `main.rs` declares these again alongside the Linux-only ones.
+//! Steb's modules, for `cargo test` on the host and for the `preview` binary;
+//! `main.rs` declares the same files again as its own crate root. All of it
+//! builds off a Kindle, `Framebuffer::offscreen` standing in for the X server.
 
 pub mod cache;
 pub mod convert;
+pub mod cover_cache;
+pub mod eink;
+pub mod font;
+pub mod net;
+pub mod orientation;
 pub mod se;
-
-/// `filter` and `sort`, holding a selection as query parameters.
-pub mod ui {
-    #[path = "filter.rs"]
-    pub mod filter;
-    #[path = "sort.rs"]
-    pub mod sort;
-}
+pub mod ui;
+pub mod wrap;

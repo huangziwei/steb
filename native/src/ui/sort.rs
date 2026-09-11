@@ -63,7 +63,6 @@ mod tests {
         let relevance = SortState(Some(Sort::Relevance));
         assert!(!relevance.available(false));
         assert!(relevance.available(true));
-        // Every other row is unconditional.
         for s in SortState::ALL.iter().filter(|s| **s != relevance) {
             assert!(s.available(false), "{} should always be offered", s.label());
         }

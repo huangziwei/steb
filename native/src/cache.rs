@@ -70,10 +70,6 @@ impl Catalogue {
         self.books.is_empty()
     }
 
-    pub fn get(&self, path: &BookPath) -> Option<&Record> {
-        self.books.get(path.as_key())
-    }
-
     pub fn contains(&self, path: &BookPath) -> bool {
         self.books.contains_key(path.as_key())
     }

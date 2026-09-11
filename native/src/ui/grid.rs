@@ -1,6 +1,6 @@
-//! Cover grid: [`Layout`], cell hit-test, image blit. Each cell is [`CELL_W`]
-//! wide and a cover aspect-fits under `image`'s bilinear `Triangle` filter. A
-//! missing cover draws a placeholder rect carrying the title.
+//! Cover grid: [`Layout`], cell hit-test, image blit. A cover aspect-fits its
+//! cell; a missing one draws a placeholder carrying the title.
+//! [`Layout::compute`] resolves every constant here against the panel once.
 
 use anyhow::Result;
 use image::{DynamicImage, ImageReader, imageops::FilterType};
@@ -8,6 +8,7 @@ use std::io::Cursor;
 
 use crate::eink::fb::Framebuffer;
 use crate::font::Script;
+use crate::ui::scale::Scale;
 use crate::ui::text::TextRenderer;
 
 /// The text in a tile's name band and the convention it is set in. The pair
@@ -19,53 +20,91 @@ pub struct Label<'a> {
     pub script: Script,
 }
 
-/// Cell width, fixed. The fleet runs ~300 ppi (KOA2 2102px/7", Scribe
-/// 3100px/10.2"), making a pixel size a physical size across it. [`Layout`]
-/// adapts the row and column count.
+/// Cell width where the panel has room for it. A cover is a physical size, so
+/// a bigger panel takes more covers rather than larger ones.
 pub const CELL_W: u32 = 360;
+/// Narrowest a cell is squeezed to in order to reach [`TARGET_COLS`]. The 6"
+/// panels reach three columns inside this band and hold two outside it.
+pub const CELL_W_MIN: u32 = 320;
 /// Tallest a cell gets, which is the height the 7" devices settle at.
 pub const CELL_H_MAX: u32 = 440;
-/// Shortest a cell gets. ~3% of cover height buys a whole extra row on a tall
-/// panel.
-pub const CELL_H_MIN: u32 = 420;
+/// Shortest a cell is squeezed to in order to fit another row.
+pub const CELL_H_MIN: u32 = 400;
 pub const COL_GAP: u32 = 32;
 pub const ROW_GAP: u32 = 20;
 
-/// The grid as it fits *this* panel: how many cells, how tall, and where the
-/// block sits. Computed once at startup from the framebuffer geometry.
+/// The page no panel goes below, whatever the cover size costs. Without it a
+/// 6" panel holds two of each, and four covers a page is a lot of paging. A
+/// panel already holding the target keeps its cover size.
+const TARGET_COLS: usize = 3;
+const TARGET_ROWS: usize = 3;
+
+/// Blank kept either side of the grid, so the outer covers clear the bezel.
+const SIDE_MARGIN: u32 = 20;
+
+/// How many `cell`-long cells fit `span` with `gap` between them, on either
+/// axis. Never zero: a panel too small for one cell still draws one.
+fn fits(span: u32, cell: u32, gap: u32) -> usize {
+    ((span + gap) / (cell + gap)).max(1) as usize
+}
+
+/// The grid as it fits *this* panel: how many cells, how wide, how tall, and
+/// where the block sits.
 #[derive(Clone, Copy, Debug)]
 pub struct Layout {
     pub cols: usize,
     pub rows: usize,
-    /// Actual cell height, between [`CELL_H_MIN`] and [`CELL_H_MAX`].
+    /// What a cell is drawn at, between the scaled [`CELL_W_MIN`] and [`CELL_W`].
+    pub cell_w: u32,
+    /// Between the scaled [`CELL_H_MIN`] and [`CELL_H_MAX`].
     pub cell_h: u32,
+    pub col_gap: u32,
+    pub row_gap: u32,
+    pub name_band_h: u32,
+    /// The panel's density, for the glyph sizes a cell draws.
+    pub scale: Scale,
     /// Origin of the cell block, centred horizontally.
     pub left: i32,
     pub top: i32,
 }
 
 impl Layout {
-    /// Rows fitted at [`CELL_H_MIN`], then given the spare height back up to
-    /// [`CELL_H_MAX`]. A plain divide by the maximum loses a row on the Scribe:
-    /// 2210px is four 440px rows with 390px stranded, against five at 426px.
+    /// As many columns and rows as fit at [`CELL_W`] / [`CELL_H_MAX`], or as
+    /// many as [`TARGET_COLS`] / [`TARGET_ROWS`] ask for if that is more, the
+    /// cell shrinking toward [`CELL_W_MIN`] / [`CELL_H_MIN`] to pay for them.
     pub fn compute(fb_xres: u32, fb_yres: u32, top_margin: u32, strip_h: u32) -> Self {
-        let cols = ((fb_xres + COL_GAP) / (CELL_W + COL_GAP)).max(1) as usize;
+        let scale = Scale::of_width(fb_xres);
+        let (col_gap, row_gap) = (scale.px(COL_GAP), scale.px(ROW_GAP));
+        let (w_min, w_max) = (scale.px(CELL_W_MIN), scale.px(CELL_W));
+        let (h_min, h_max) = (scale.px(CELL_H_MIN), scale.px(CELL_H_MAX));
+        let name_band_h = scale.px(NAME_BAND_H);
+
         let avail = fb_yres.saturating_sub(top_margin + strip_h);
-        let rows = ((avail + ROW_GAP) / (CELL_H_MIN + ROW_GAP)).max(1) as usize;
-        let cell_h = (avail.saturating_sub((rows as u32 - 1) * ROW_GAP) / rows as u32)
-            .clamp(CELL_H_MIN, CELL_H_MAX);
+        let span = fb_xres.saturating_sub(scale.px(SIDE_MARGIN) * 2).max(1);
 
-        let grid_w = cols as u32 * CELL_W + (cols as u32 - 1) * COL_GAP;
+        let cols = fits(span, w_max, col_gap).max(fits(span, w_min, col_gap).min(TARGET_COLS));
+        let rows = fits(avail, h_max, row_gap).max(fits(avail, h_min, row_gap).min(TARGET_ROWS));
+        let cell_w =
+            (span.saturating_sub((cols as u32 - 1) * col_gap) / cols as u32).clamp(w_min, w_max);
+        let cell_h =
+            (avail.saturating_sub((rows as u32 - 1) * row_gap) / rows as u32).clamp(h_min, h_max);
 
-        // Centred between the search bar and the pager strip. `cell_h` clamps
-        // to [`CELL_H_MAX`], leaving ~136px of slack on a 1696px Colorsoft.
-        let content_h = rows as u32 * cell_h + (rows as u32 - 1) * ROW_GAP;
+        let grid_w = cols as u32 * cell_w + (cols as u32 - 1) * col_gap;
+
+        // `cell_h` clamps to `CELL_H_MAX`, so a tall panel leaves real slack and
+        // anchoring to the top would spend all of it below the grid.
+        let content_h = rows as u32 * cell_h + (rows as u32 - 1) * row_gap;
         let slack = avail.saturating_sub(content_h);
 
         Self {
             cols,
             rows,
+            cell_w,
             cell_h,
+            col_gap,
+            row_gap,
+            name_band_h,
+            scale,
             left: ((fb_xres as i32) - grid_w as i32) / 2,
             top: (top_margin + slack / 2) as i32,
         }
@@ -81,8 +120,8 @@ impl Layout {
         let col = idx % self.cols;
         let row = idx / self.cols;
         (
-            self.left + col as i32 * (CELL_W + COL_GAP) as i32,
-            self.top + row as i32 * (self.cell_h + ROW_GAP) as i32,
+            self.left + col as i32 * (self.cell_w + self.col_gap) as i32,
+            self.top + row as i32 * (self.cell_h + self.row_gap) as i32,
         )
     }
 
@@ -93,15 +132,15 @@ impl Layout {
         }
         let local_x = (tx as i32 - self.left) as u32;
         let local_y = (ty as i32 - self.top) as u32;
-        let stride_x = CELL_W + COL_GAP;
-        let stride_y = self.cell_h + ROW_GAP;
+        let stride_x = self.cell_w + self.col_gap;
+        let stride_y = self.cell_h + self.row_gap;
         let col = (local_x / stride_x) as usize;
         let row = (local_y / stride_y) as usize;
         if col >= self.cols || row >= self.rows {
             return None;
         }
         // A tap in the gap between two cells resolves to neither.
-        if local_x % stride_x >= CELL_W || local_y % stride_y >= self.cell_h {
+        if local_x % stride_x >= self.cell_w || local_y % stride_y >= self.cell_h {
             return None;
         }
         let idx = row * self.cols + col;
@@ -131,14 +170,23 @@ const CHECK_MARGIN: i32 = 10;
 /// badge and the arm cue.
 const CHECK_SHADE: u8 = 0x55;
 
-/// Decode a JPEG/PNG byte buffer and resize to fit inside `CELL_W × CELL_H_MAX`,
+/// Border thickness [`outline_cell`] frames a pressed cell with.
+const OUTLINE_T: u32 = 6;
+/// Side of [`draw_arm_cue`]'s badge.
+const ARM_BADGE: u32 = 140;
+/// Side padding inside a tile's name band.
+const NAME_PAD: u32 = 16;
+/// The rule between the cover and the name band.
+const BAND_RULE: u32 = 2;
+
+/// Decode a JPEG/PNG byte buffer and resize to fit inside `layout`'s cell box,
 /// preserving aspect. Returns the resized image in its source color (the cover
 /// thumbnail is a color JPEG; [`blit_fit`] samples its RGB).
-pub fn decode_resize(bytes: &[u8]) -> Result<DynamicImage> {
+pub fn decode_resize(bytes: &[u8], layout: Layout) -> Result<DynamicImage> {
     let img = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()?
         .decode()?;
-    Ok(img.resize(CELL_W, CELL_H_MAX, FilterType::Triangle))
+    Ok(img.resize(layout.cell_w, layout.cell_h, FilterType::Triangle))
 }
 
 /// The aspect-fit placement of an `iw × ih` image inside the box, the rect
@@ -201,23 +249,25 @@ pub fn blit_fit(
     rect
 }
 
-/// A 6px black border framing the pressed cell. Transient, and the loudest
-/// thing the grid draws; [`draw_downloaded_badge`] carries standing state.
-pub fn outline_cell(fb: &mut Framebuffer, cell_x: i32, cell_y: i32, cell_h: u32) {
-    outline_rect(fb, cell_x, cell_y, CELL_W, cell_h, 6, 0x00);
+/// A black border framing the pressed cell. Transient, and the loudest thing
+/// the grid draws; [`draw_downloaded_badge`] carries standing state.
+pub fn outline_cell(fb: &mut Framebuffer, layout: Layout, cell_x: i32, cell_y: i32) {
+    let t = layout.scale.px(OUTLINE_T);
+    outline_rect(fb, cell_x, cell_y, layout.cell_w, layout.cell_h, t, 0x00);
 }
 
 /// A gray check disc top-right of `cover`, [`draw_book_cell`]'s painted rect,
 /// marking a book in [`crate::DOWNLOAD_DIR`]. SE covers carry a title plate
 /// along the bottom edge. A zero-size rect no-ops.
-pub fn draw_downloaded_badge(fb: &mut Framebuffer, cover: (i32, i32, u32, u32)) {
+pub fn draw_downloaded_badge(fb: &mut Framebuffer, scale: Scale, cover: (i32, i32, u32, u32)) {
     let (ox, oy, w, h) = cover;
     if w == 0 || h == 0 {
         return;
     }
-    let r = CHECK_D / 2;
-    let cx = ox + w as i32 - CHECK_MARGIN - r;
-    let cy = oy + CHECK_MARGIN + r;
+    let r = scale.i(CHECK_D) / 2;
+    let margin = scale.i(CHECK_MARGIN);
+    let cx = ox + w as i32 - margin - r;
+    let cy = oy + margin + r;
     fill_disc(fb, cx, cy, r, CHECK_SHADE);
     draw_check_glyph(fb, cx, cy, r, 0xFF);
 }
@@ -273,24 +323,24 @@ fn dist_to_seg(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
 /// The armed cue past `crate::ARM_THRESHOLD`: a dark badge with a light
 /// download glyph over the cover, drawn on [`outline_cell`] in one refresh.
 /// `(cell_x, cell_y)` is [`Layout::cell_xy`]'s origin; off-screen no-ops.
-pub fn draw_arm_cue(fb: &mut Framebuffer, cell_x: i32, cell_y: i32, cell_h: u32) {
+pub fn draw_arm_cue(fb: &mut Framebuffer, layout: Layout, cell_x: i32, cell_y: i32) {
     if cell_x < 0 || cell_y < 0 {
         return;
     }
     // Center the badge on the cover region (the cell minus the bottom name band).
-    let cover_h = cell_h - NAME_BAND_H;
-    let cx = cell_x + CELL_W as i32 / 2;
+    let cover_h = layout.cell_h.saturating_sub(layout.name_band_h);
+    let cx = cell_x + layout.cell_w as i32 / 2;
     let cy = cell_y + cover_h as i32 / 2;
-    const BADGE: u32 = 140;
-    let half = BADGE as i32 / 2;
+    let badge = layout.scale.px(ARM_BADGE);
+    let half = badge as i32 / 2;
     fb.fill_rect(
         (cy - half).max(cell_y) as u32,
         (cx - half).max(cell_x) as u32,
-        BADGE,
-        BADGE,
+        badge,
+        badge,
         0x00,
     );
-    draw_download_glyph(fb, cx, cy, BADGE as i32 / 4, 0xFF);
+    draw_download_glyph(fb, cx, cy, badge as i32 / 4, 0xFF);
 }
 
 /// Draw a `thickness`-px outline rectangle (the four edges of `w × h` at
@@ -373,9 +423,10 @@ fn corner_arc(fb: &mut Framebuffer, cx: i32, cy: i32, r: u32, t: u32, shade: u8,
 /// Draw a magnifier glyph (a ring + a lower-right diagonal handle) centered at
 /// `(cx, cy)` with lens radius `r`. No face in the chain carries 🔍.
 pub fn draw_magnifier(fb: &mut Framebuffer, cx: i32, cy: i32, r: u32, shade: u8) {
-    const T: u32 = 3;
+    // Stroke tracks the lens: a fixed 3 px ring vanishes on a 167 ppi panel.
+    let t = (r / 6).max(1);
     let rf = r as f32;
-    let inner = r.saturating_sub(T) as f32;
+    let inner = r.saturating_sub(t) as f32;
     for dy in -(r as i32)..=r as i32 {
         for dx in -(r as i32)..=r as i32 {
             let dist = ((dx * dx + dy * dy) as f32).sqrt();
@@ -390,8 +441,8 @@ pub fn draw_magnifier(fb: &mut Framebuffer, cx: i32, cy: i32, r: u32, shade: u8)
     for i in 0..len {
         let d = start + i as f32;
         let (hx, hy) = (cx + (d * 0.707) as i32, cy + (d * 0.707) as i32);
-        for by in 0..T as i32 {
-            for bx in 0..T as i32 {
+        for by in 0..t as i32 {
+            for bx in 0..t as i32 {
                 fb.put_pixel(hx + bx, hy + by, shade);
             }
         }
@@ -401,8 +452,10 @@ pub fn draw_magnifier(fb: &mut Framebuffer, cx: i32, cy: i32, r: u32, shade: u8)
 /// Draw an `✕` (two diagonals) centered at `(cx, cy)`, half-extent `size` — the
 /// search field's clear button.
 pub fn draw_x(fb: &mut Framebuffer, cx: i32, cy: i32, size: i32, shade: u8) {
+    // Two pixels of stroke at 300 ppi; one at 167, where two is a smudge.
+    let t = (size / 8).max(1);
     for i in -size..=size {
-        for k in 0..2 {
+        for k in 0..t {
             fb.put_pixel(cx + i, cy + i + k, shade);
             fb.put_pixel(cx + i, cy - i + k, shade);
         }
@@ -413,9 +466,10 @@ pub fn draw_x(fb: &mut Framebuffer, cx: i32, cy: i32, size: i32, shade: u8) {
 /// with ring radius `r`, each arc gap capped by a tangential arrowhead. No face
 /// in the chain carries 🔄.
 pub fn draw_sync_glyph(fb: &mut Framebuffer, cx: i32, cy: i32, r: i32, shade: u8) {
-    const T: i32 = 5;
+    // Ring stroke tracks the radius, like [`draw_magnifier`]'s.
+    let t = (r / 8).max(1);
     let rf = r as f32;
-    let inner = (r - T).max(1) as f32;
+    let inner = (r - t).max(1) as f32;
     // Ring pixels minus two gaps (screen coords, +y down): near 10° and near
     // 190°, leaving two arcs spanning roughly [38°,162°] and [218°,342°].
     for dy in -r..=r {
@@ -558,9 +612,9 @@ pub fn draw_key_glyph(fb: &mut Framebuffer, cx: i32, cy: i32, s: i32, shade: u8)
 fn draw_cover_tile(
     fb: &mut Framebuffer,
     renderer: &mut TextRenderer,
+    layout: Layout,
     cell_x: i32,
     cell_y: i32,
-    cell_h: u32,
     top_inset: u32,
     cover: Option<&DynamicImage>,
     label: Label,
@@ -568,33 +622,34 @@ fn draw_cover_tile(
     if cell_x < 0 || cell_y < 0 {
         return (cell_x, cell_y, 0, 0);
     }
-    fb.fill_rect(cell_y as u32, cell_x as u32, CELL_W, cell_h, 0xFF);
+    let (cell_w, cell_h) = (layout.cell_w, layout.cell_h);
+    let (name_band_h, s) = (layout.name_band_h, layout.scale);
+    fb.fill_rect(cell_y as u32, cell_x as u32, cell_w, cell_h, 0xFF);
 
     // Cover region: full cell width (edge-to-edge, no inset card or frame),
     // between the optional top inset and the bottom name band. The cover
     // aspect-fits exactly like a standalone book cover.
     let region_y = cell_y + top_inset as i32;
-    let region_h = cell_h - NAME_BAND_H - top_inset;
+    let region_h = cell_h.saturating_sub(name_band_h + top_inset);
     let rect = match cover {
-        Some(img) => blit_fit(fb, cell_x, region_y, CELL_W, region_h, img),
+        Some(img) => blit_fit(fb, cell_x, region_y, cell_w, region_h, img),
         None => {
             // No cover yet: a light fill spanning the region width.
-            fb.fill_rect(region_y as u32, cell_x as u32, CELL_W, region_h, 0xDD);
-            (cell_x, region_y, CELL_W, region_h)
+            fb.fill_rect(region_y as u32, cell_x as u32, cell_w, region_h, 0xDD);
+            (cell_x, region_y, cell_w, region_h)
         }
     };
 
-    // Name band: a 2px separator then the label, centered and clamped to one
+    // Name band: a separator rule then the label, centered and clamped to one
     // ellipsized line so a long title can't overrun the cell.
-    let band_top = cell_y as u32 + (cell_h - NAME_BAND_H);
-    fb.fill_rect(band_top, cell_x as u32, CELL_W, 2, 0x00);
-    const PAD: u32 = 16;
-    let width = CELL_W.saturating_sub(PAD * 2);
+    let band_top = cell_y as u32 + cell_h.saturating_sub(name_band_h);
+    fb.fill_rect(band_top, cell_x as u32, cell_w, s.px(BAND_RULE), 0x00);
+    let width = cell_w.saturating_sub(s.px(NAME_PAD) * 2);
     let lines = renderer.wrap_and_clamp_in(label.script, label.text, width, 1);
     if let Some(line) = lines.first() {
         let lw = renderer.measure_width_in(label.script, line);
-        let lx = cell_x + ((CELL_W as i32 - lw as i32) / 2).max(0);
-        let baseline = band_top as i32 + (NAME_BAND_H * 62 / 100) as i32;
+        let lx = cell_x + ((cell_w as i32 - lw as i32) / 2).max(0);
+        let baseline = band_top as i32 + (name_band_h * 62 / 100) as i32;
         renderer.draw_in(label.script, fb, lx, baseline, line, false);
     }
     rect
@@ -606,13 +661,13 @@ fn draw_cover_tile(
 pub fn draw_book_cell(
     fb: &mut Framebuffer,
     renderer: &mut TextRenderer,
+    layout: Layout,
     cell_x: i32,
     cell_y: i32,
-    cell_h: u32,
     cover: Option<&DynamicImage>,
     title: Label,
 ) -> (i32, i32, u32, u32) {
-    draw_cover_tile(fb, renderer, cell_x, cell_y, cell_h, 0, cover, title)
+    draw_cover_tile(fb, renderer, layout, cell_x, cell_y, 0, cover, title)
 }
 
 /// A series tile: [`draw_cover_tile`] with the series name in the band, two
@@ -622,22 +677,23 @@ pub fn draw_book_cell(
 pub fn draw_series_cell(
     fb: &mut Framebuffer,
     renderer: &mut TextRenderer,
+    layout: Layout,
     cell_x: i32,
     cell_y: i32,
-    cell_h: u32,
     cover: Option<&DynamicImage>,
     count: usize,
     name: Label,
 ) {
+    let s = layout.scale;
     // A series reserves [`BAR_STRIP_H`] above the cover for its stack bars.
     // The cover itself matches a book's, lining the two up in the grid.
     let (cov_x, cov_y, cov_w, cov_h) = draw_cover_tile(
         fb,
         renderer,
+        layout,
         cell_x,
         cell_y,
-        cell_h,
-        BAR_STRIP_H,
+        s.px(BAR_STRIP_H),
         cover,
         name,
     );
@@ -650,18 +706,19 @@ pub fn draw_series_cell(
     let cx = cov_x + cov_w as i32 / 2;
     let bar_lo_w = cov_w * 86 / 100;
     let bar_hi_w = cov_w * 66 / 100;
+    let bar_h = s.px(BAR_H);
     fb.fill_rect(
-        (cov_y - (BAR_H as i32 + 4)).max(cell_y) as u32,
+        (cov_y - (bar_h as i32 + s.i(4))).max(cell_y) as u32,
         (cx - bar_lo_w as i32 / 2).max(cell_x) as u32,
         bar_lo_w,
-        BAR_H,
+        bar_h,
         0x66,
     );
     fb.fill_rect(
-        (cov_y - (BAR_H as i32 * 2 + 6)).max(cell_y) as u32,
+        (cov_y - (bar_h as i32 * 2 + s.i(6))).max(cell_y) as u32,
         (cx - bar_hi_w as i32 / 2).max(cell_x) as u32,
         bar_hi_w,
-        BAR_H,
+        bar_h,
         0x99,
     );
 
@@ -670,10 +727,11 @@ pub fn draw_series_cell(
     let badge_text = count.to_string();
     let lh = renderer.line_height().max(1);
     let tw = renderer.measure_width(&badge_text);
-    let badge_w = tw + BADGE_PAD * 2;
-    let badge_h = lh + BADGE_PAD;
-    let badge_x = cov_x + BADGE_MARGIN as i32;
-    let badge_y = cov_y + cov_h as i32 - badge_h as i32 - BADGE_MARGIN as i32;
+    let (badge_pad, badge_margin) = (s.px(BADGE_PAD), s.i(BADGE_MARGIN as i32));
+    let badge_w = tw + badge_pad * 2;
+    let badge_h = lh + badge_pad;
+    let badge_x = cov_x + badge_margin;
+    let badge_y = cov_y + cov_h as i32 - badge_h as i32 - badge_margin;
     fb.fill_rect(
         badge_y.max(cell_y) as u32,
         badge_x.max(cell_x) as u32,
@@ -689,6 +747,8 @@ pub fn draw_series_cell(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::pager::strip_h;
+    use crate::ui::searchbar::margin as top_margin;
 
     /// The 7" panels take 3×3 at the full cell height. Both geometries are
     /// checked: a Colorsoft reports 1272×1696, and a rule holding for
@@ -704,25 +764,42 @@ mod tests {
         }
     }
 
-    /// The Scribe's extra area buys rows, not bigger covers.
+    /// The Scribe's extra area buys cells, not bigger covers.
     #[test]
     fn scribe_gains_rows_and_columns() {
         let l = Layout::compute(1860, 2480, 190, 80);
-        assert_eq!((l.cols, l.rows), (4, 5));
-        assert_eq!(l.page_size(), 20);
-        assert_eq!(l.left, 162);
-        // Fit-then-expand: five rows exist below [`CELL_H_MAX`], over the floor.
-        assert!(
-            (CELL_H_MIN..CELL_H_MAX).contains(&l.cell_h),
-            "cell_h {} outside [{CELL_H_MIN}, {CELL_H_MAX})",
-            l.cell_h
+        assert_eq!((l.cols, l.rows), (4, 4));
+        assert_eq!(l.page_size(), 16);
+        assert_eq!(
+            l.cell_w, CELL_W,
+            "a wider panel takes more covers, not bigger"
         );
-        // Everything has to actually fit between the header and the strip.
+        assert_eq!(l.cell_h, CELL_H_MAX);
+        // Everything has to actually fit between the search bar and the strip.
         let used = l.rows as u32 * l.cell_h + (l.rows as u32 - 1) * ROW_GAP;
         assert!(
             used <= 2480 - 190 - 80,
             "{used} overflows the usable height"
         );
+    }
+
+    /// The 6" panels reach [`TARGET_COLS`] by squeezing the cell.
+    #[test]
+    fn the_six_inch_panels_reach_the_target_page() {
+        for (w, h) in [(600u32, 800u32), (758, 1024)] {
+            let l = Layout::compute(w, h, top_margin(w), strip_h(w));
+            assert_eq!((l.cols, l.rows), (3, 3), "{w}x{h}");
+            let s = Scale::of_width(w);
+            assert!(
+                (s.px(CELL_W_MIN)..=s.px(CELL_W)).contains(&l.cell_w),
+                "{w}x{h}: cell_w {} outside the band",
+                l.cell_w
+            );
+            // The block, plus its side margins, stays on the panel.
+            let grid_w = l.cols as u32 * l.cell_w + (l.cols as u32 - 1) * l.col_gap;
+            assert!(grid_w <= w, "{w}x{h}: grid_w {grid_w} overflows");
+            assert!(l.left >= 0, "{w}x{h}: grid starts off-panel");
+        }
     }
 
     /// A panel under one full cell yields a usable grid, past a divide-by-zero

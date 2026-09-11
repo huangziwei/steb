@@ -69,6 +69,10 @@ const FONT_DIRS: &[&str] = &[
 // Unscanned: `/chroot/usr/java/lib/fonts` mirrors the system set and
 // `/var/local/font/**` holds the CJK packs.
 
+/// Colon-separated directories scanned ahead of [`FONT_DIRS`], for a host that
+/// has none of the device's faces. Unset on a Kindle.
+pub const FONT_DIR_ENV: &str = "STEB_FONTS";
+
 /// Face families in preference order, matched case-insensitively against the
 /// filename. Ember leads, the Kindle's own UI typeface; `code2000` sorts last,
 /// a pan-Unicode catch-all keeping the chain non-empty.
@@ -118,7 +122,12 @@ fn rank(file_name: &str) -> (usize, usize) {
 /// accented author names and transliterated Russian past pure ASCII.
 pub fn discover() -> Vec<Candidate> {
     let mut found: Vec<(usize, usize, PathBuf)> = Vec::new();
-    for dir in FONT_DIRS {
+    let extra = std::env::var(FONT_DIR_ENV).unwrap_or_default();
+    let dirs = extra
+        .split(':')
+        .filter(|d| !d.is_empty())
+        .chain(FONT_DIRS.iter().copied());
+    for dir in dirs {
         let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
@@ -551,9 +560,8 @@ mod tests {
             faces[0], "Amazon-Ember-Regular.ttf",
             "the device's UI typeface, upright and regular, must draw the UI"
         );
-        // The traps, each of which beat Regular under an earlier ranking:
-        // a bold family whose cut is named "Regular", and two weights with no
-        // bold-ish token in the name at all.
+        // A bold family whose cut is named "Regular", and weights carrying no
+        // bold-ish token at all: neither may outrank the upright regular.
         for trap in [
             "AmazonEmberBold-Regular.ttf",
             "Amazon-Ember-Heavy.ttf",

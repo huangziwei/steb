@@ -5,9 +5,15 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 /// The bokai binary [`locate`] probes.
 pub const BIN_PATH: &str = "/mnt/us/extensions/bokai/bin/bokai";
+
+/// How long [`Converter::convert_watched`] leaves between `try_wait` calls.
+/// Short enough that a cover arriving over this app is noticed promptly,
+/// long enough that the poll costs nothing against a minutes-long convert.
+const POLL: Duration = Duration::from_millis(200);
 
 /// Extension of [`Converter::convert`]'s output.
 const KFX: &str = "kfx";
@@ -84,17 +90,39 @@ impl Converter {
     /// renamed to [`output_path`], `azw3` removed. `-t` names the format the
     /// `.partial` extension does not.
     pub fn convert(&self, azw3: &Path) -> Result<PathBuf, Error> {
+        self.convert_watched(azw3, |_| {})
+    }
+
+    /// [`Converter::convert`], running `tick` about every [`POLL`] with the
+    /// elapsed time. A conversion runs for minutes, so it is polled rather
+    /// than waited on: `tick` is the caller's chance to service the screen.
+    pub fn convert_watched(
+        &self,
+        azw3: &Path,
+        mut tick: impl FnMut(Duration),
+    ) -> Result<PathBuf, Error> {
         let kfx = output_path(azw3);
         let staged = staging_path(&kfx);
         // `staged` from an interrupted run.
         remove_if_present(&staged)?;
 
-        let status = Command::new(&self.exe)
-            .arg("convert")
-            .args(["-t", KFX])
-            .arg(azw3)
-            .arg(&staged)
-            .status();
+        let started = Instant::now();
+        let status = (|| -> std::io::Result<ExitStatus> {
+            let mut child = Command::new(&self.exe)
+                .arg("convert")
+                .args(["-t", KFX])
+                .arg(azw3)
+                .arg(&staged)
+                .stdin(Stdio::null())
+                .spawn()?;
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(status);
+                }
+                tick(started.elapsed());
+                std::thread::sleep(POLL);
+            }
+        })();
 
         match status {
             Ok(s) if s.success() && staged.is_file() => {}

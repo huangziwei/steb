@@ -5,14 +5,20 @@
 use crate::eink::fb::{Framebuffer, MxcfbRect, WAVEFORM_MODE_DU, WAVEFORM_MODE_GC16};
 use crate::eink::input::{Input, InputEvent};
 use crate::eink::touch::TouchEvent;
-use crate::orientation::Orientation;
+use crate::ui::scale::Scale;
 use crate::ui::sort::SortState;
+use crate::ui::strip;
 use crate::ui::text::TextRenderer;
 
-/// Bottom `[ Done ]` strip height — matches `ui/diag.rs`'s generous button row.
-const STRIP_H: u32 = 120;
 /// Left inset for the title and row labels.
-const MARGIN_X: u32 = 60;
+const MARGIN_X_PX: u32 = 60;
+/// Row-height floor, so a tap target stays a fingertip at any font size.
+const ROW_H_MIN: u32 = 96;
+
+/// Side margin on a panel `fb_xres` wide.
+fn margin_x(fb_xres: u32) -> u32 {
+    Scale::of_width(fb_xres).px(MARGIN_X_PX)
+}
 
 /// What a tap resolved to. SE bakes direction into each option it offers
 /// ("Author name (a → z)"), leaving no direction row.
@@ -33,14 +39,15 @@ struct Layout {
 }
 
 impl Layout {
-    fn compute(renderer: &TextRenderer, yres: u32) -> Self {
+    fn compute(renderer: &TextRenderer, xres: u32, yres: u32) -> Self {
+        let scale = Scale::of_width(xres);
         let lh = renderer.line_height().max(1);
         Layout {
             lh,
             rows_top: lh * 3,
-            // Generous tap targets — 96px floor regardless of font size.
-            row_h: (lh * 2).max(96),
-            strip_top: yres.saturating_sub(STRIP_H),
+            // Generous tap targets — a [`ROW_H_MIN`] floor regardless of font size.
+            row_h: (lh * 2).max(scale.px(ROW_H_MIN)),
+            strip_top: strip::top(xres, yres),
         }
     }
 
@@ -104,35 +111,45 @@ fn render(
             fb.fill_rect(row_top, 0, xres, layout.row_h, 0x00);
         }
         let baseline = (row_top + layout.row_h * 60 / 100) as i32;
-        renderer.draw(fb, MARGIN_X as i32, baseline, row.label(), selected);
+        renderer.draw(fb, margin_x(xres) as i32, baseline, row.label(), selected);
     }
 
-    draw_done(fb, renderer, layout);
+    draw_done(fb, renderer);
 }
 
-/// Full-width `[ Done ]` strip at the bottom, `ui/diag.rs` style.
-fn draw_done(fb: &mut Framebuffer, renderer: &mut TextRenderer, layout: &Layout) {
+/// Full-width `[ Done ]` bar at the bottom.
+fn draw_done(fb: &mut Framebuffer, renderer: &mut TextRenderer) {
     let xres = fb.var.xres;
-    let top = layout.strip_top;
-    fb.fill_rect(top, 0, xres, 2, 0x00); // top divider
-    fb.fill_rect(top + 2, 0, xres, STRIP_H - 2, 0xFF); // white body
-    let label = "[ Done ]";
-    let w = renderer.measure_width(label);
-    let x = ((xres as i32 - w as i32) / 2).max(0);
-    let baseline = (top + STRIP_H * 60 / 100) as i32;
-    renderer.draw(fb, x, baseline, label, false);
+    let top = strip::base(fb);
+    let baseline = strip::baseline(xres, top, renderer);
+    strip::label(fb, renderer, 0, xres, baseline, "[ Done ]", false);
+}
+
+/// The picker as [`run`] first draws it, without a device behind it.
+/// `crate::bin::preview` reads it back as a PNG.
+pub fn render_screen(
+    fb: &mut Framebuffer,
+    renderer: &mut TextRenderer,
+    state: SortState,
+    has_query: bool,
+) {
+    let rows: Vec<SortState> = SortState::ALL
+        .into_iter()
+        .filter(|s| s.available(has_query))
+        .collect();
+    let layout = Layout::compute(renderer, fb.var.xres, fb.var.yres);
+    render(fb, renderer, state, &rows, &layout);
 }
 
 /// The sort picker seeded with `initial`, blocking until Done and returning the
-/// chosen `SortState`. `orient` tracks rotation for the caller. `has_query`
-/// gates the Relevance row, a sort SE accepts alongside a query alone.
+/// chosen `SortState`. `has_query` gates the Relevance row, a sort SE accepts
+/// alongside a query alone.
 pub fn run(
     fb: &mut Framebuffer,
     input: &mut Input,
     renderer: &mut TextRenderer,
     initial: SortState,
     has_query: bool,
-    orient: &mut Orientation,
 ) -> anyhow::Result<SortState> {
     let rows: Vec<SortState> = SortState::ALL
         .into_iter()
@@ -140,12 +157,12 @@ pub fn run(
         .collect();
 
     let mut state = initial;
-    let mut layout = Layout::compute(renderer, fb.var.yres);
+    let mut layout = Layout::compute(renderer, fb.var.xres, fb.var.yres);
     render(fb, renderer, state, &rows, &layout);
     fb.send_update(full_rect(fb), WAVEFORM_MODE_GC16)?;
 
     loop {
-        match input.next()? {
+        match input.next_event()? {
             InputEvent::Touch(TouchEvent::Up { y, .. }) => match layout.hit(y, rows.len()) {
                 Some(Tap::Row(i)) if state != rows[i] => {
                     state = rows[i];
@@ -163,12 +180,23 @@ pub fn run(
             }
             // Seven rows fit on one screen — nothing to page.
             InputEvent::Page(_) => {}
+            // The one place this overlay drains the X queue and re-reads the
+            // framework orientation; `crate::eink::input` throttles the read.
             InputEvent::Tick => {
-                let o = Orientation::detect();
-                if o != *orient {
-                    *orient = o;
-                    input.set_orientation(o);
-                    layout = Layout::compute(renderer, fb.var.yres);
+                let pump = fb.pump_events();
+                if let Some(covered) = pump.covered {
+                    input.set_covered(covered);
+                }
+                input.retake();
+                let turned = input.follow_orientation();
+                if turned || pump.resized.is_some() {
+                    input.set_size(fb.var.xres, fb.var.yres);
+                }
+                if pump.covered == Some(true) {
+                    continue;
+                }
+                if turned || pump.resized.is_some() || pump.repaint || pump.covered.is_some() {
+                    layout = Layout::compute(renderer, fb.var.xres, fb.var.yres);
                     render(fb, renderer, state, &rows, &layout);
                     fb.send_update(full_rect(fb), WAVEFORM_MODE_GC16)?;
                 }

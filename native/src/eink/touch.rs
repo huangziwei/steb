@@ -69,6 +69,8 @@ pub enum SwipeDir {
 const EVIOCGRAB: libc::c_int = 0x40044590;
 
 pub struct Touch {
+    /// What this reader resolved to, for the log's header block.
+    said: String,
     file: File,
     cur_x: i32,
     cur_y: i32,
@@ -95,6 +97,10 @@ pub struct Touch {
     /// screenshot recognizer is starved, and [`TouchEvent::Screenshot`]
     /// replaces it.
     grabbed: bool,
+    /// Whether [`Touch::open`]'s `EVIOCGRAB` took. Read by [`Touch::retake`].
+    exclusive: bool,
+    /// [`Touch::set_covered`]'s state: no grab, no [`Touch::next_event`].
+    covered: bool,
     /// The orientation the framebuffer was opened with. Raw touch coords
     /// mirror by the same amount, matching what the panel draws.
     orientation: Orientation,
@@ -130,7 +136,18 @@ impl Touch {
                 path.display()
             );
         }
+        // One line of what the reader resolved to. The node and the grab are
+        // the same on every launch of one build on one device.
+        let said = format!(
+            "touch={} grab={}",
+            path.display(),
+            match grabbed {
+                true => "ok",
+                false => "refused",
+            },
+        );
         Ok(Self {
+            said,
             file,
             cur_x: 0,
             cur_y: 0,
@@ -144,6 +161,8 @@ impl Touch {
             screenshot_latched: false,
             suppress_next_up: false,
             grabbed,
+            exclusive: grabbed,
+            covered: false,
             orientation,
             fb_xres,
             fb_yres,
@@ -164,6 +183,57 @@ impl Touch {
         self.orientation = orientation;
     }
 
+    /// The size being drawn, after a relayout. Left stale, an
+    /// `Orientation::Down` mirror lands off-screen and the screenshot corners
+    /// sit wrong: both are measured from these.
+    pub fn set_size(&mut self, fb_xres: u32, fb_yres: u32) {
+        self.fb_xres = fb_xres;
+        self.fb_yres = fb_yres;
+    }
+
+    /// What this reader resolved to, for the log's header block.
+    pub fn describe(&self) -> &str {
+        &self.said
+    }
+
+    /// Drops `EVIOCGRAB` while another window covers this app's, and takes it
+    /// back when that window goes. The grab is exclusive: held under the
+    /// passcode or the ads screen, nothing can reach them.
+    pub fn set_covered(&mut self, covered: bool) {
+        if covered == self.covered {
+            return;
+        }
+        self.covered = covered;
+        let want = i32::from(!covered);
+        let ok = unsafe { libc::ioctl(self.file.as_raw_fd(), EVIOCGRAB as _, want) } == 0;
+        self.grabbed = ok && !covered;
+        eprintln!("touch: covered={covered} grabbed={}", self.grabbed);
+        self.forget_stroke();
+    }
+
+    /// Retakes `EVIOCGRAB` where `exclusive` holds and `grabbed` does not.
+    pub fn retake(&mut self) {
+        if self.grabbed || self.covered || !self.exclusive {
+            return;
+        }
+        self.grabbed = unsafe { libc::ioctl(self.file.as_raw_fd(), EVIOCGRAB as _, 1) } == 0;
+        if self.grabbed {
+            eprintln!("touch: EVIOCGRAB retaken — exclusive");
+        }
+    }
+
+    /// Clears the pending `Down`/`Up` boundary and both slots, so a stroke
+    /// split across a cover boundary raises no half of itself.
+    fn forget_stroke(&mut self) {
+        self.down_pending = false;
+        self.up_pending = false;
+        self.cur_slot = 0;
+        self.slot0_active = false;
+        self.slot1_active = false;
+        self.screenshot_latched = false;
+        self.suppress_next_up = false;
+    }
+
     /// The available events drained. `Some` on a completed `Down`/`Up` boundary
     /// in orientation-corrected coords, `None` on a move-only or partial
     /// packet, which the caller re-polls. Boundary state lives on `self`.
@@ -171,6 +241,10 @@ impl Touch {
         let mut buf = [0u8; EVENT_BYTES];
         loop {
             match self.file.read(&mut buf) {
+                // Covered: the record is read and dropped. A failed ungrab
+                // leaves this device ours, so the drop is what keeps a
+                // passcode tap from also reaching the grid underneath.
+                Ok(EVENT_BYTES) if self.covered => continue,
                 Ok(EVENT_BYTES) => {}
                 // evdev hands back whole 16-byte records: a short read is an
                 // empty buffer.

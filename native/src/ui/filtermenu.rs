@@ -5,15 +5,23 @@
 use crate::eink::fb::{Framebuffer, MxcfbRect, WAVEFORM_MODE_DU, WAVEFORM_MODE_GC16};
 use crate::eink::input::{Input, InputEvent};
 use crate::eink::touch::TouchEvent;
-use crate::orientation::Orientation;
 use crate::ui::filter::Filters;
+use crate::ui::scale::Scale;
 use crate::ui::sort::SortState;
 use crate::ui::sortmenu;
+use crate::ui::strip;
 use crate::ui::text::TextRenderer;
 
-/// Bottom strip height — matches `ui/sortmenu.rs` and `ui/diag.rs`.
-const STRIP_H: u32 = 120;
-const MARGIN_X: u32 = 60;
+const MARGIN_X_PX: u32 = 60;
+/// Row-height floor, so a tap target stays a fingertip at any font size.
+const ROW_H_MIN: u32 = 96;
+/// Gap over the section title.
+const TITLE_GAP: u32 = 8;
+
+/// Side margin on a panel `fb_xres` wide.
+fn margin_x(fb_xres: u32) -> u32 {
+    Scale::of_width(fb_xres).px(MARGIN_X_PX)
+}
 
 enum Tap {
     /// Index into the visible page's rows.
@@ -27,23 +35,27 @@ struct Layout {
     rows_top: u32,
     row_h: u32,
     strip_top: u32,
+    /// The panel's density, for the gap over the title.
+    scale: Scale,
     /// Rows that fit on one page, always at least one.
     per_page: usize,
 }
 
 impl Layout {
-    fn compute(renderer: &TextRenderer, yres: u32) -> Self {
+    fn compute(renderer: &TextRenderer, xres: u32, yres: u32) -> Self {
+        let scale = Scale::of_width(xres);
         let lh = renderer.line_height().max(1);
         let rows_top = lh * 3;
-        // Generous tap targets — 96px floor regardless of font size, matching
-        // the sort picker so the two menus feel like one thing.
-        let row_h = lh.saturating_mul(2).max(96);
-        let strip_top = yres.saturating_sub(STRIP_H);
+        // Generous tap targets — a [`ROW_H_MIN`] floor regardless of font
+        // size, matching the sort picker so the two menus feel like one thing.
+        let row_h = lh.saturating_mul(2).max(scale.px(ROW_H_MIN));
+        let strip_top = strip::top(xres, yres);
         let per_page = ((strip_top.saturating_sub(rows_top)) / row_h).max(1) as usize;
         Layout {
             rows_top,
             row_h,
             strip_top,
+            scale,
             per_page,
         }
     }
@@ -118,7 +130,7 @@ fn draw_row(
     let row_top = layout.rows_top + slot as u32 * layout.row_h;
     fb.fill_rect(row_top, 0, fb.var.xres, layout.row_h, 0xFF);
     let baseline = (row_top + layout.row_h * 60 / 100) as i32;
-    renderer.draw(fb, MARGIN_X as i32, baseline, text, false);
+    renderer.draw(fb, margin_x(fb.var.xres) as i32, baseline, text, false);
 }
 
 fn render(
@@ -145,44 +157,55 @@ fn render(
     };
     let tw = renderer.measure_width(&title);
     let tx = ((xres as i32 - tw as i32) / 2).max(0);
-    renderer.draw(fb, tx, (layout.rows_top - 8) as i32, &title, false);
+    let title_y = layout.rows_top.saturating_sub(layout.scale.px(TITLE_GAP));
+    renderer.draw(fb, tx, title_y as i32, &title, false);
 
     for (slot, tag) in page_rows(tags, page, layout.per_page).iter().enumerate() {
         draw_row(fb, renderer, layout, slot, &row_text(filters, tag));
     }
 
-    draw_strip(fb, renderer, layout, page, pages);
+    draw_strip(fb, renderer, page, pages);
 }
 
 /// Bottom strip: `< Prev` | `[ Done ]` | `Next >`, with the paging labels drawn
 /// only when there is somewhere to go.
-fn draw_strip(
-    fb: &mut Framebuffer,
-    renderer: &mut TextRenderer,
-    layout: &Layout,
-    page: usize,
-    pages: usize,
-) {
+fn draw_strip(fb: &mut Framebuffer, renderer: &mut TextRenderer, page: usize, pages: usize) {
     let xres = fb.var.xres;
-    let top = layout.strip_top;
     let third = xres / 3;
-    fb.fill_rect(top, 0, xres, 2, 0x00);
-    fb.fill_rect(top + 2, 0, xres, STRIP_H - 2, 0xFF);
-
-    let baseline = (top + STRIP_H * 60 / 100) as i32;
-    let centered = |label: &str, slot: u32, renderer: &mut TextRenderer, fb: &mut Framebuffer| {
-        let w = renderer.measure_width(label);
-        let x = (slot * third) as i32 + ((third as i32 - w as i32) / 2).max(0);
-        renderer.draw(fb, x, baseline, label, false);
-    };
+    let top = strip::base(fb);
+    let baseline = strip::baseline(xres, top, renderer);
 
     if page > 0 {
-        centered("< Prev", 0, renderer, fb);
+        strip::label(fb, renderer, 0, third, baseline, "< Prev", false);
     }
-    centered("[ Done ]", 1, renderer, fb);
+    strip::label(fb, renderer, third, third, baseline, "[ Done ]", false);
     if page + 1 < pages {
-        centered("Next >", 2, renderer, fb);
+        strip::label(
+            fb,
+            renderer,
+            third * 2,
+            xres - third * 2,
+            baseline,
+            "Next >",
+            false,
+        );
     }
+    strip::separator(fb, third);
+    strip::separator(fb, third * 2);
+}
+
+/// The menu as [`run`] first draws it, without a device behind it.
+/// `crate::bin::preview` reads it back as a PNG.
+pub fn render_screen(
+    fb: &mut Framebuffer,
+    renderer: &mut TextRenderer,
+    tags: &[String],
+    filters: &Filters,
+    page: usize,
+) {
+    let layout = Layout::compute(renderer, fb.var.xres, fb.var.yres);
+    let page = page.min(n_pages(tags.len(), layout.per_page).saturating_sub(1));
+    render(fb, renderer, filters, tags, page, &layout);
 }
 
 /// Run the subject filter. Mutates `filters` in place; the caller snapshots it
@@ -194,9 +217,8 @@ pub fn run(
     renderer: &mut TextRenderer,
     tags: &[String],
     filters: &mut Filters,
-    orient: &mut Orientation,
 ) -> anyhow::Result<()> {
-    let mut layout = Layout::compute(renderer, fb.var.yres);
+    let mut layout = Layout::compute(renderer, fb.var.xres, fb.var.yres);
     let mut page = 0usize;
     render(fb, renderer, filters, tags, page, &layout);
     fb.send_update(full_rect(fb), WAVEFORM_MODE_GC16)?;
@@ -205,7 +227,7 @@ pub fn run(
         let pages = n_pages(tags.len(), layout.per_page);
         let visible = page_rows(tags, page, layout.per_page).len();
 
-        match input.next()? {
+        match input.next_event()? {
             InputEvent::Touch(TouchEvent::Up { x, y }) => {
                 match layout.hit(x, y, fb.var.xres, visible) {
                     Some(Tap::Row(slot)) => {
@@ -248,13 +270,24 @@ pub fn run(
                     fb.send_update(full_rect(fb), WAVEFORM_MODE_GC16)?;
                 }
             }
+            // The one place this overlay drains the X queue and re-reads the
+            // framework orientation; `crate::eink::input` throttles the read.
             InputEvent::Tick => {
-                let o = Orientation::detect();
-                if o != *orient {
-                    *orient = o;
-                    input.set_orientation(o);
-                    layout = Layout::compute(renderer, fb.var.yres);
-                    page = page.min(n_pages(tags.len(), layout.per_page) - 1);
+                let pump = fb.pump_events();
+                if let Some(covered) = pump.covered {
+                    input.set_covered(covered);
+                }
+                input.retake();
+                let turned = input.follow_orientation();
+                if turned || pump.resized.is_some() {
+                    input.set_size(fb.var.xres, fb.var.yres);
+                }
+                if pump.covered == Some(true) {
+                    continue;
+                }
+                if turned || pump.resized.is_some() || pump.repaint || pump.covered.is_some() {
+                    layout = Layout::compute(renderer, fb.var.xres, fb.var.yres);
+                    page = page.min(n_pages(tags.len(), layout.per_page).saturating_sub(1));
                     render(fb, renderer, filters, tags, page, &layout);
                     fb.send_update(full_rect(fb), WAVEFORM_MODE_GC16)?;
                 }
@@ -270,8 +303,7 @@ pub fn run_sort(
     renderer: &mut TextRenderer,
     sort: &mut SortState,
     has_query: bool,
-    orient: &mut Orientation,
 ) -> anyhow::Result<()> {
-    *sort = sortmenu::run(fb, input, renderer, *sort, has_query, orient)?;
+    *sort = sortmenu::run(fb, input, renderer, *sort, has_query)?;
     Ok(())
 }

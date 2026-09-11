@@ -29,7 +29,6 @@ pub fn store(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
 /// The book's other `<slug>.*.jpg` files, past `keep`. The trailing dot on the
 /// prefix keeps `jane-austen_emma.` clear of `jane-austen_emma-and-more.…`.
 fn prune_old(dir: &Path, name: &str, keep: &Path) {
-    // `<slug>.<sha>.jpg` → prefix `<slug>.`
     let Some(slug) = name.split('.').next() else {
         return;
     };

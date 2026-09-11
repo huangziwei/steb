@@ -2,7 +2,8 @@
 //! paginated cover grid; `keyboard`, `filtermenu` and `sortmenu` open as
 //! blocking sub-loops. A held cover downloads, then `convert` writes a `.kfx`.
 
-// `eink` and `ui` carry helpers the run loop leaves uncalled.
+// This crate root compiles the same files as `lib.rs`, where the preview and
+// the tests call what the run loop does not.
 #![allow(dead_code)]
 
 mod cache;
@@ -28,6 +29,7 @@ use image::DynamicImage;
 use se::listing::Hit;
 use se::url::{Endpoint, Listing};
 use ui::filter::Filters;
+use ui::scale::Scale;
 use ui::sort::SortState;
 use ui::text::TextRenderer;
 use ui::{diag, filtermenu, grid, keyboard, pager, searchbar, toast};
@@ -41,27 +43,45 @@ const THUMBNAILS_DIR: &str = "/mnt/us/system/thumbnails";
 /// Where `bin/steb.sh` funnels this process's stderr.
 const LOG_PATH: &str = "/mnt/us/logs/steb.log";
 
+/// Body size, a design pixel at [`Scale::DESIGN_DPI`]: [`font_px`] takes it to
+/// the panel's own density.
 const FONT_PX: f32 = 32.0;
-/// Headroom above the grid for the search bar.
-const TOP_MARGIN: u32 = searchbar::TOP + searchbar::HEIGHT + 16;
+/// The grid as it fits the panel `fb` is drawing at.
+fn layout_for(fb: &Framebuffer) -> grid::Layout {
+    grid::Layout::compute(
+        fb.var.xres,
+        fb.var.yres,
+        searchbar::margin(fb.var.xres),
+        pager::strip_h(fb.var.xres),
+    )
+}
 
 /// How long a cover must be held, within [`ARM_SLOP_PX`], before its download
 /// arms and fires. A tap downloads nothing.
 const ARM_THRESHOLD: Duration = Duration::from_millis(1000);
-/// Max drift in user-visible px, either axis, across a hold.
+/// Max drift, either axis, across a hold. A design pixel: unscaled it is a much
+/// larger share of a 600 px panel than of a 1264 px one, and a hold there
+/// becomes near-impossible to cancel by drifting.
 const ARM_SLOP_PX: u32 = 40;
+
+/// [`ARM_SLOP_PX`] on a panel `fb_xres` wide.
+fn arm_slop(fb_xres: u32) -> u32 {
+    Scale::of_width(fb_xres).px(ARM_SLOP_PX)
+}
 /// How long the armed cue holds the panel before the download overlay.
 const ARM_DWELL: Duration = Duration::from_millis(250);
 /// How long the hint after a too-short tap holds the panel.
 const TOAST_LINGER: Duration = Duration::from_millis(1200);
+/// What [`download`] reports when the Cancel button was tapped.
+const CANCELLED: &str = "Cancelled";
 
 /// Refresh rect for one grid cell.
-fn cell_rect(cell_x: i32, cell_y: i32, cell_h: u32) -> MxcfbRect {
+fn cell_rect(layout: grid::Layout, cell_x: i32, cell_y: i32) -> MxcfbRect {
     MxcfbRect {
         top: cell_y.max(0) as u32,
         left: cell_x.max(0) as u32,
-        width: grid::CELL_W,
-        height: cell_h,
+        width: layout.cell_w,
+        height: layout.cell_h,
     }
 }
 
@@ -170,6 +190,39 @@ fn with_diag<T>(
     }
 }
 
+/// The `Tick` of a blocking step: drains the X queue so a window put over this
+/// app mid-download still reaches [`Input::set_covered`], and retakes the grab
+/// when it goes. Draws nothing — the banner on the panel is still the banner.
+fn working_tick(fb: &mut Framebuffer, input: &mut Input) {
+    let pump = fb.pump_events();
+    if let Some(covered) = pump.covered {
+        input.set_covered(covered);
+    }
+    input.retake();
+}
+
+/// [`working_tick`], then whether `cancel` was tapped. The screenshot gesture
+/// is honoured here too: it is the one gesture that must work mid-download.
+fn working_poll(
+    fb: &mut Framebuffer,
+    input: &mut Input,
+    cancel: MxcfbRect,
+) -> anyhow::Result<bool> {
+    working_tick(fb, input);
+    while let Some(ev) = input.poll_now()? {
+        match ev {
+            InputEvent::Touch(TouchEvent::Up { x, y }) if toast::in_rect(cancel, x, y) => {
+                return Ok(true);
+            }
+            InputEvent::Touch(TouchEvent::Screenshot) => {
+                let _ = eink::screenshot::capture(fb);
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
 /// The next SE page into `view`, where `view.more` holds.
 fn fetch_next_page(
     client: &se::http::Client,
@@ -264,15 +317,14 @@ fn draw_page(
         let rect = grid::draw_book_cell(
             fb,
             renderer,
+            layout,
             cx,
             cy,
-            layout.cell_h,
             cover,
             label_of(&view.hits[idx]),
         );
-        // [`is_downloaded`] draws a corner check.
         if is_downloaded(view, idx) {
-            grid::draw_downloaded_badge(fb, rect);
+            grid::draw_downloaded_badge(fb, layout.scale, rect);
         }
     }
 
@@ -329,7 +381,7 @@ fn fill_covers(
             },
         };
 
-        let Ok(img) = grid::decode_resize(&bytes) else {
+        let Ok(img) = grid::decode_resize(&bytes, layout) else {
             log(format!("cover {name}: decode failed"));
             continue;
         };
@@ -339,24 +391,16 @@ fn fill_covers(
         let rect = grid::draw_book_cell(
             fb,
             renderer,
+            layout,
             cx,
             cy,
-            layout.cell_h,
             view.covers[idx].as_ref(),
             label_of(&view.hits[idx]),
         );
         if is_downloaded(view, idx) {
-            grid::draw_downloaded_badge(fb, rect);
+            grid::draw_downloaded_badge(fb, layout.scale, rect);
         }
-        fb.send_update(
-            MxcfbRect {
-                top: cy.max(0) as u32,
-                left: cx.max(0) as u32,
-                width: grid::CELL_W,
-                height: layout.cell_h,
-            },
-            WAVEFORM_MODE_DU,
-        )?;
+        fb.send_update(cell_rect(layout, cx, cy), WAVEFORM_MODE_DU)?;
     }
     Ok(())
 }
@@ -365,13 +409,20 @@ fn fill_covers(
 /// then [`to_kfx`].
 fn download(
     fb: &mut Framebuffer,
+    input: &mut Input,
     renderer: &mut TextRenderer,
     client: &se::http::Client,
     conv: Option<&convert::Converter>,
     hit: &Hit,
 ) -> anyhow::Result<String> {
-    let (rect, _) = toast::draw_download(fb, renderer, &hit.title, "Fetching…");
+    let (rect, cancel) = toast::draw_download(fb, renderer, &hit.title, "Fetching…");
     fb.send_update(rect, WAVEFORM_MODE_GC16)?;
+
+    // `bytes` and `text` are each one blocking call, so between them is the
+    // only seam: a cover is noticed here, the grab released, a Cancel read.
+    if working_poll(fb, input, cancel)? {
+        return Ok(CANCELLED.to_string());
+    }
 
     let html = match online(|| client.text(&Endpoint::Book(hit.path.clone()))) {
         Ok(h) => h,
@@ -381,6 +432,10 @@ fn download(
         Ok(p) => p,
         Err(e) => return Ok(format!("Failed: {e}")),
     };
+
+    if working_poll(fb, input, cancel)? {
+        return Ok(CANCELLED.to_string());
+    }
 
     let rect = toast::draw_progress(fb, renderer, &hit.title, 0, 1);
     fb.send_update(rect, WAVEFORM_MODE_DU)?;
@@ -399,6 +454,10 @@ fn download(
         Err(e) => return Ok(format!("Failed: {e}")),
     };
 
+    // Past the write the book is on the device, so there is nothing left to
+    // cancel. The drain still runs.
+    working_tick(fb, input);
+
     // `ThumbnailHref::file_name` is written verbatim. A failure leaves the
     // grey placeholder.
     if let Some(thumb) = page.thumbnail {
@@ -414,7 +473,7 @@ fn download(
     }
 
     let file_name = match conv {
-        Some(c) => to_kfx(fb, renderer, c, &hit.title, &azw3)?.unwrap_or(file_name),
+        Some(c) => to_kfx(fb, input, renderer, c, &hit.title, &azw3)?.unwrap_or(file_name),
         None => file_name,
     };
 
@@ -423,8 +482,10 @@ fn download(
 
 /// `conv.convert(azw3)` under a banner, returning the `.kfx` file name.
 /// A [`convert::Error`] goes to [`log`] and returns `None`, leaving `azw3`.
+#[allow(clippy::too_many_arguments)]
 fn to_kfx(
     fb: &mut Framebuffer,
+    input: &mut Input,
     renderer: &mut TextRenderer,
     conv: &convert::Converter,
     title: &str,
@@ -433,7 +494,8 @@ fn to_kfx(
     let rect = toast::draw_download_done(fb, renderer, &format!("{title}\nConverting to KFX…"));
     fb.send_update(rect, WAVEFORM_MODE_GC16)?;
 
-    match conv.convert(azw3) {
+    // bokai runs for minutes; `working_tick` is what keeps the screen serviced.
+    match conv.convert_watched(azw3, |_| working_tick(fb, input)) {
         Ok(kfx) => {
             log(format!("converted {}", kfx.display()));
             Ok(kfx.file_name().map(|n| n.to_string_lossy().into_owned()))
@@ -446,12 +508,22 @@ fn to_kfx(
 }
 
 fn finish(file_name: &str) -> String {
-    // [`se::download::request_reindex`] puts the file in the library.
     se::download::request_reindex();
     format!("Downloaded {file_name}")
 }
 
+/// Writes the X/eink dump [`eink::xprobe`] collects, then exits. It opens no
+/// framebuffer and draws nothing, so it is a flag and never a screen.
+const PROBE_FLAG: &str = "--probe-x";
+
 fn main() {
+    if std::env::args().skip(1).any(|a| a == PROBE_FLAG) {
+        if let Err(e) = eink::xprobe::run() {
+            eprintln!("xprobe: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Err(e) = run() {
         log(format!("fatal: {e:#}"));
         std::process::exit(1);
@@ -467,7 +539,7 @@ fn run() -> anyhow::Result<()> {
     let mut renderer = TextRenderer::load(FONT_PX)?;
     log(format!("fonts: {}", renderer.chain_description()));
 
-    let mut orient = orientation::Orientation::detect();
+    let orient = orientation::Orientation::detect();
     let mut fb = Framebuffer::open()?;
     let touch = Touch::open(orient, fb.var.xres, fb.var.yres)?;
     let buttons = match Buttons::open() {
@@ -486,6 +558,13 @@ fn run() -> anyhow::Result<()> {
     };
     let mut input = Input::new(touch, buttons);
     input.set_orientation(orient);
+    // The same on every launch of one build on one device: a header line, not
+    // something the body should repeat.
+    log(format!("surface: {}", fb.describe()));
+    log(format!(
+        "input: {} orientation={orient:?}",
+        input.describe()
+    ));
 
     // `converter` is `None` where bokai is not installed at `convert::BIN_PATH`.
     let converter = convert::locate();
@@ -526,7 +605,7 @@ fn run() -> anyhow::Result<()> {
     let _ = cache::store(&cat_path, &catalogue);
 
     // ---- Grid loop ------------------------------------------------------
-    let mut layout = grid::Layout::compute(fb.var.xres, fb.var.yres, TOP_MARGIN, pager::STRIP_H);
+    let mut layout = layout_for(&fb);
     let mut page = 0usize;
     let mut total_pages = pager::n_pages(view.hits.len(), layout.page_size());
 
@@ -587,16 +666,16 @@ fn run() -> anyhow::Result<()> {
                 let rect = grid::draw_book_cell(
                     &mut fb,
                     &mut renderer,
+                    layout,
                     cx,
                     cy,
-                    layout.cell_h,
                     view.covers.get(idx).and_then(|c| c.as_ref()),
                     label_of(&view.hits[idx]),
                 );
                 if is_downloaded(&view, idx) {
-                    grid::draw_downloaded_badge(&mut fb, rect);
+                    grid::draw_downloaded_badge(&mut fb, layout.scale, rect);
                 }
-                fb.send_update(cell_rect(cx, cy, layout.cell_h), WAVEFORM_MODE_DU)?;
+                fb.send_update(cell_rect(layout, cx, cy), WAVEFORM_MODE_DU)?;
             }
         }};
     }
@@ -634,8 +713,8 @@ fn run() -> anyhow::Result<()> {
                     continue;
                 }
 
-                // A `Tick` arm clears `armed`. A cover armed here was released
-                // inside [`ARM_THRESHOLD`].
+                // A `Tick` arm clears `armed`, so one still set here was
+                // released inside [`ARM_THRESHOLD`].
                 if let Some(a) = armed.take() {
                     log(format!(
                         "short tap ({:?}), showing hint",
@@ -648,7 +727,6 @@ fn run() -> anyhow::Result<()> {
                     repaint!();
                     continue;
                 }
-                // `searchbar` sits above the grid.
                 if let Some(tap) = searchbar::hit(x, y, fb.var.xres, !view.query.is_empty()) {
                     match tap {
                         searchbar::Tap::Clear => {
@@ -659,13 +737,7 @@ fn run() -> anyhow::Result<()> {
                             repaint!();
                         }
                         searchbar::Tap::Open => {
-                            let q = keyboard::run(
-                                &mut fb,
-                                &mut input,
-                                &mut renderer,
-                                &view.query,
-                                &mut orient,
-                            )?;
+                            let q = keyboard::run(&mut fb, &mut input, &mut renderer, &view.query)?;
                             if q != view.query {
                                 view.query = q;
                                 view.clear_results();
@@ -678,7 +750,6 @@ fn run() -> anyhow::Result<()> {
                     continue;
                 }
 
-                // Pager strip.
                 if let Some(hit) = pager::hit(x, y, fb.var.xres, fb.var.yres, total_pages) {
                     match hit {
                         pager::PagerHit::Exit => return Ok(()),
@@ -691,7 +762,6 @@ fn run() -> anyhow::Result<()> {
                                 &mut renderer,
                                 &tags,
                                 &mut view.filters,
-                                &mut orient,
                             )?;
                             if (view.filters.clone(), view.sort) != before {
                                 view.clear_results();
@@ -708,7 +778,6 @@ fn run() -> anyhow::Result<()> {
                                 &mut renderer,
                                 &mut view.sort,
                                 has_query,
-                                &mut orient,
                             )?;
                             view.clear_results();
                             ensure_page!(0);
@@ -724,6 +793,14 @@ fn run() -> anyhow::Result<()> {
                 // A lift on a cover does nothing: the download fires from `Tick`.
             }
             InputEvent::Touch(TouchEvent::Down { x, y }) => {
+                // `follow_orientation_now` maps the `Up` this stroke ends on.
+                // A `Down` behind a change is dropped, leaving a tap at its `Up`.
+                if input.follow_orientation_now() {
+                    layout = layout_for(&fb);
+                    (armed, down_pos) = (None, None);
+                    repaint!();
+                    continue;
+                }
                 // Every stroke's landing point, margins and strip included.
                 down_pos = Some((x, y));
                 // An outline under the press, ahead of [`ARM_THRESHOLD`].
@@ -734,8 +811,8 @@ fn run() -> anyhow::Result<()> {
                     let idx = page * layout.page_size() + slot;
                     let (cx, cy) = layout.cell_xy(slot);
                     if idx < view.hits.len() && cx >= 0 && cy >= 0 {
-                        grid::outline_cell(&mut fb, cx, cy, layout.cell_h);
-                        fb.send_update(cell_rect(cx, cy, layout.cell_h), WAVEFORM_MODE_DU)?;
+                        grid::outline_cell(&mut fb, layout, cx, cy);
+                        fb.send_update(cell_rect(layout, cx, cy), WAVEFORM_MODE_DU)?;
                         armed = Some(Armed {
                             slot,
                             idx,
@@ -748,10 +825,19 @@ fn run() -> anyhow::Result<()> {
             InputEvent::Touch(TouchEvent::Screenshot) => {
                 let _ = eink::screenshot::capture(&mut fb);
             }
-            InputEvent::Page(dir) => match dir {
-                PageButton::Next => next_page!(),
-                PageButton::Prev => prev_page!(),
-            },
+            // `dir` carries the orientation standing before this read; a
+            // change drops it and repaints in the new frame.
+            InputEvent::Page(dir) => {
+                if input.follow_orientation_now() {
+                    layout = layout_for(&fb);
+                    repaint!();
+                    continue;
+                }
+                match dir {
+                    PageButton::Next => next_page!(),
+                    PageButton::Prev => prev_page!(),
+                }
+            }
             InputEvent::Tick => {
                 // The arm deadline, or an idle poll reaching the orientation check.
                 if armed
@@ -762,7 +848,8 @@ fn run() -> anyhow::Result<()> {
                     // Drift past [`ARM_SLOP_PX`] is a drag. One cell repaints:
                     // its `Up` is often a page-turn swipe.
                     let (px, py) = input.touch_pos();
-                    if px.abs_diff(a.at.0) > ARM_SLOP_PX || py.abs_diff(a.at.1) > ARM_SLOP_PX {
+                    let slop = arm_slop(fb.var.xres);
+                    if px.abs_diff(a.at.0) > slop || py.abs_diff(a.at.1) > slop {
                         log(format!(
                             "arm cancelled: drifted to ({px},{py}) from ({},{})",
                             a.at.0, a.at.1
@@ -777,8 +864,8 @@ fn run() -> anyhow::Result<()> {
                     // The armed cue holds for [`ARM_DWELL`] under the overlay.
                     let (cx, cy) = layout.cell_xy(a.slot);
                     if cx >= 0 && cy >= 0 {
-                        grid::draw_arm_cue(&mut fb, cx, cy, layout.cell_h);
-                        fb.send_update(cell_rect(cx, cy, layout.cell_h), WAVEFORM_MODE_DU)?;
+                        grid::draw_arm_cue(&mut fb, layout, cx, cy);
+                        fb.send_update(cell_rect(layout, cx, cy), WAVEFORM_MODE_DU)?;
                         std::thread::sleep(ARM_DWELL);
                     }
                     // Fires under the finger. The lift finds `armed` taken.
@@ -787,7 +874,14 @@ fn run() -> anyhow::Result<()> {
                         a.down_at.elapsed(),
                         hit.title
                     ));
-                    let msg = download(&mut fb, &mut renderer, &client, converter.as_ref(), &hit)?;
+                    let msg = download(
+                        &mut fb,
+                        &mut input,
+                        &mut renderer,
+                        &client,
+                        converter.as_ref(),
+                        &hit,
+                    )?;
                     log(&msg);
                     let rect = toast::draw_download_done(&mut fb, &mut renderer, &msg);
                     fb.send_update(rect, WAVEFORM_MODE_GC16)?;
@@ -797,13 +891,30 @@ fn run() -> anyhow::Result<()> {
                     repaint!();
                     continue;
                 }
-                let o = orientation::Orientation::detect();
-                if o != orient {
-                    orient = o;
-                    input.set_orientation(o);
-                    layout =
-                        grid::Layout::compute(fb.var.xres, fb.var.yres, TOP_MARGIN, pager::STRIP_H);
-                    repaint!();
+                // Nothing else drains the X queue. Any of a cover, a relayout
+                // or a rotation takes `armed` with it: the repaint below
+                // erases `grid::outline_cell`.
+                let pump = fb.pump_events();
+                if let Some(covered) = pump.covered {
+                    (armed, down_pos) = (None, None);
+                    input.set_covered(covered);
+                }
+                input.retake();
+                let turned = input.follow_orientation();
+                if turned || pump.resized.is_some() {
+                    input.set_size(fb.var.xres, fb.var.yres);
+                    layout = layout_for(&fb);
+                }
+                match pump.covered {
+                    // Covered: the panel belongs to the window over this one.
+                    Some(true) => {}
+                    // Uncovered: drawn without an `Expose` to ask for it.
+                    Some(false) => repaint!(),
+                    None if turned || pump.resized.is_some() || pump.repaint => {
+                        (armed, down_pos) = (None, None);
+                        repaint!();
+                    }
+                    None => {}
                 }
             }
         }

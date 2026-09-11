@@ -1,8 +1,9 @@
 //! Display surface: a WM-managed fullscreen X11 window. `backing` holds packed
-//! RGB ([`CH`] bytes/pixel, white=255) and reaches the server at identity
-//! through [`Framebuffer::send_update`].
+//! RGB ([`CH`] bytes/pixel, white=255) and reaches the server at identity. The
+//! WM sizes the window; `var`, `backing` and `wire_stride` move with it.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
@@ -11,8 +12,8 @@ use x11rb::connection::Connection;
 use x11rb::connection::RequestConnection as _;
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{
-    AtomEnum, ConnectionExt, CreateGCAux, CreateWindowAux, EventMask, Gcontext, ImageFormat,
-    ImageOrder, PropMode, Screen, Window, WindowClass,
+    Atom, AtomEnum, ConnectionExt, CreateGCAux, CreateWindowAux, EventMask, Gcontext, ImageFormat,
+    ImageOrder, PropMode, Screen, Visibility, Window, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
 // `change_property8` lives in the wrapper `ConnectionExt`.
@@ -61,6 +62,40 @@ fn wire_channels(conn: &RustConnection, screen: &Screen, bpp: usize) -> Option<[
         offset(visual.green_mask),
         offset(visual.blue_mask),
     ])
+}
+
+/// `events` folded into a [`Pump`] against `covered` and the `size` drawn. The
+/// last event wins; `VisibilityNotify` sets `covered` either way where a
+/// [`SCREENSAVER_MESSAGE`] sets it true alone.
+fn fold(events: &[Event], screensaver: Atom, covered: bool, size: (u32, u32)) -> Pump {
+    let mut pump = Pump::default();
+    let mut folded = covered;
+    for event in events {
+        match event {
+            Event::Expose(_) => pump.repaint = true,
+            // `ConfigureNotify` carries the size the window is laid out at.
+            Event::ConfigureNotify(ev) => {
+                let laid = (u32::from(ev.width), u32::from(ev.height));
+                pump.resized = (laid != size && laid.0 > 0 && laid.1 > 0).then_some(laid);
+            }
+            // `FULLY_OBSCURED` is the whole panel; anything less is a share of it.
+            Event::VisibilityNotify(ev) => folded = ev.state == Visibility::FULLY_OBSCURED,
+            // `data8[0]` of 1 covers; a 0 leaves `folded` alone.
+            Event::ClientMessage(ev) if screensaver != 0 && ev.type_ == screensaver => {
+                folded |= ev.data.as_data8()[0] != 0;
+            }
+            Event::Error(e) => {
+                // A `put_image` the server rejects arrives here.
+                eprintln!("x11: WARNING request failed: {e:?}");
+                pump.repaint = true;
+            }
+            _ => {}
+        }
+    }
+    if folded != covered {
+        pump.covered = Some(folded);
+    }
+    pump
 }
 
 /// `pixel_bytes` rounded up to a multiple of `pad`, the bytes `put_image` takes
@@ -126,7 +161,26 @@ pub struct Var {
     pub yres: u32,
 }
 
-pub struct Framebuffer {
+/// What [`Framebuffer::pump_events`] answers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Pump {
+    /// Set by `Expose` and by `Event::Error`.
+    pub repaint: bool,
+    /// `Some(true)` covered, `Some(false)` uncovered, `None` unchanged.
+    pub covered: Option<bool>,
+    /// A `ConfigureNotify` size differing from the one being drawn.
+    pub resized: Option<(u32, u32)>,
+}
+
+/// How long [`Framebuffer::open`] waits for `MapNotify`.
+const LAYOUT_WAIT: Duration = Duration::from_millis(500);
+
+/// Atom naming the message a `CMS~E:ss` `WM_NAME` subscribes to.
+const SCREENSAVER_MESSAGE: &[u8] = b"lab126_screen_saver";
+
+/// The window a [`Framebuffer`] presents through, and the wire format the
+/// server takes it in.
+struct Surface {
     conn: RustConnection,
     win: Window,
     gc: Gcontext,
@@ -137,14 +191,28 @@ pub struct Framebuffer {
     /// Wire bytes per scanline: [`wire_stride`] over `xres` and the format's
     /// `scanline_pad`.
     wire_stride: usize,
+    /// The format's `scanline_pad`, in bytes: [`wire_stride`]'s second half.
+    scanline_pad: usize,
     /// R, G, B offsets within a `bytes_per_pixel`-wide wire pixel. Depth-24
     /// little-endian BGRX is `[2, 1, 0]`. Unused on depth-8.
     chan: [usize; 3],
+    /// The interned [`SCREENSAVER_MESSAGE`] atom, or 0.
+    screensaver: Atom,
+    /// Whether another window covers this one. [`fold`] reports its changes.
+    covered: bool,
+    /// Per-`PutImage` byte budget (server max request length minus header slack).
+    max_req_bytes: usize,
+}
+
+pub struct Framebuffer {
+    /// Where a frame is presented. `None` under [`Framebuffer::offscreen`].
+    surface: Option<Surface>,
     pub var: Var,
     /// Packed RGB ([`CH`] bytes/pixel), stride `xres * CH`.
     backing: Vec<u8>,
-    /// Per-`PutImage` byte budget (server max request length minus header slack).
-    max_req_bytes: usize,
+    /// What the surface resolved to, one line for the log. Empty offscreen,
+    /// where there is no server to have answered.
+    said: String,
 }
 
 impl Framebuffer {
@@ -152,27 +220,26 @@ impl Framebuffer {
     pub fn open() -> Result<Self> {
         let (conn, screen_num) = x11rb::connect(None).context("connect to X ($DISPLAY)")?;
         let screen = conn.setup().roots[screen_num].clone();
-        let xres = screen.width_in_pixels as u32;
-        let yres = screen.height_in_pixels as u32;
+        // The root size, until `get_geometry` answers below.
+        let mut xres = screen.width_in_pixels as u32;
+        let mut yres = screen.height_in_pixels as u32;
         let depth = screen.root_depth;
-        // Depth 8 -> 1; depth 24 and 32 -> 4.
         let format = conn
             .setup()
             .pixmap_formats
             .iter()
             .find(|f| f.depth == depth);
+        // Depth 8 -> 1; depth 24 and 32 -> 4.
         let bytes_per_pixel = format
             .map(|f| (f.bits_per_pixel as usize / 8).max(1))
             .unwrap_or(1);
         // `scanline_pad` is 32 bits on every standard format.
         let scanline_pad = format.map(|f| f.scanline_pad as usize / 8).unwrap_or(4);
-        let wire_stride = wire_stride(xres as usize * bytes_per_pixel, scanline_pad);
         // `[2, 1, 0]` is BGRX little-endian, the lab126 depth-24 layout.
         let chan = wire_channels(&conn, &screen, bytes_per_pixel).unwrap_or([2, 1, 0]);
-        eprintln!(
-            "fb: xres={xres} yres={yres} depth={depth} bytes_per_pixel={bytes_per_pixel} \
-             scanline_pad={scanline_pad} wire_stride={wire_stride} \
-             chan=[{},{},{}] root_visual=0x{:x}",
+        let root_said = format!(
+            "root {xres}x{yres} depth={depth} bytes_per_pixel={bytes_per_pixel} \
+             scanline_pad={scanline_pad} chan=[{},{},{}] root_visual=0x{:x}",
             chan[0], chan[1], chan[2], screen.root_visual,
         );
 
@@ -191,12 +258,20 @@ impl Framebuffer {
             // `CreateWindowAux` sets no `backing_store`.
             &CreateWindowAux::new()
                 .background_pixel(screen.white_pixel)
-                .event_mask(EventMask::EXPOSURE),
+                // `STRUCTURE_NOTIFY` carries `MapNotify` and `ConfigureNotify`;
+                // the WM lays this window out and may not hand it the root size.
+                // `VISIBILITY_CHANGE` reports a window put over this one.
+                .event_mask(
+                    EventMask::EXPOSURE
+                        | EventMask::VISIBILITY_CHANGE
+                        | EventMask::STRUCTURE_NOTIFY,
+                ),
         )
         .context("create_window")?;
 
-        // `WM_NAME` carries the lab126 WM's layout spec.
-        let name = b"L:A_N:application_ID:com.steb.picker_PC:N_O:U";
+        // `WM_NAME` carries the lab126 WM's layout spec: application layer, no
+        // chrome, fullscreen. `CMS~E:ss` subscribes to [`SCREENSAVER_MESSAGE`].
+        let name = b"L:A_N:application_ID:com.steb.picker_PC:N_O:U_CMS~E:ss";
         conn.change_property8(
             PropMode::REPLACE,
             win,
@@ -213,52 +288,103 @@ impl Framebuffer {
             .context("create_gc")?;
         conn.flush().context("flush after map")?;
 
-        // `get_geometry` against the requested `xres` / `yres`.
+        // `MapNotify` marks the layout done.
+        let deadline = Instant::now() + LAYOUT_WAIT;
+        let mut mapped = false;
+        while !mapped && Instant::now() < deadline {
+            while let Ok(Some(event)) = conn.poll_for_event() {
+                mapped |= matches!(event, Event::MapNotify(_));
+            }
+            if !mapped {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        // `get_geometry` now that the WM has laid the window out.
         match conn
             .get_geometry(win)
             .map_err(|e| e.to_string())
             .and_then(|c| c.reply().map_err(|e| e.to_string()))
         {
-            Ok(g) => {
-                if u32::from(g.width) != xres || u32::from(g.height) != yres || g.x != 0 || g.y != 0
-                {
-                    eprintln!(
-                        "fb: WARNING window geometry {}x{}+{}+{} != root {xres}x{yres}+0+0 \
-                         — edge-anchored UI will be clipped",
-                        g.width, g.height, g.x, g.y
-                    );
-                } else {
-                    eprintln!("fb: window geometry matches root ({xres}x{yres})");
-                }
+            Ok(g) if u32::from(g.width) != xres || u32::from(g.height) != yres => {
+                // `get_geometry` outranks the root read: the UI is drawn at the
+                // size the window is laid out at, not the panel's.
+                eprintln!(
+                    "fb: window is {}x{}, root read {xres}x{yres}",
+                    g.width, g.height
+                );
+                (xres, yres) = (u32::from(g.width), u32::from(g.height));
             }
+            Ok(_) => {}
             Err(e) => eprintln!("fb: could not read window geometry: {e}"),
         }
+
+        // `wire_stride` follows `xres`, which `get_geometry` above sets.
+        let wire_stride = wire_stride(xres as usize * bytes_per_pixel, scanline_pad);
 
         // `maximum_request_bytes` is the post-BIG-REQUESTS limit (~16 MB), past
         // `setup().maximum_request_length`. A 1860×2480 frame is 4.6 MB: one
         // request, uncapped.
         let max_req_bytes = conn.maximum_request_bytes().max(4096);
-        eprintln!(
-            "fb: max request {} bytes ({} rows/band at {} bpp)",
-            max_req_bytes,
+
+        // One line of everything the surface resolved to. Every part of it is
+        // the same on every launch of one build on one device.
+        let said = format!(
+            "{root_said} mapped={mapped} drawing {xres}x{yres} stride={wire_stride} \
+             maxreq={max_req_bytes} ({} rows/band)",
             max_req_bytes / wire_stride.max(1),
-            bytes_per_pixel
         );
+        eprintln!("fb: {said}");
+
+        // `only_if_exists` false creates the atom. [`fold`] matches no
+        // `ClientMessage` against the 0 an unanswered reply leaves.
+        let screensaver = conn
+            .intern_atom(false, SCREENSAVER_MESSAGE)
+            .map_err(|e| e.to_string())
+            .and_then(|c| c.reply().map_err(|e| e.to_string()))
+            .map(|r| r.atom)
+            .unwrap_or_else(|e| {
+                eprintln!("fb: could not intern lab126_screen_saver: {e}");
+                0
+            });
 
         let backing = vec![0xFFu8; xres as usize * yres as usize * CH];
 
         Ok(Self {
-            conn,
-            win,
-            gc,
-            depth,
-            bytes_per_pixel,
-            wire_stride,
-            chan,
+            surface: Some(Surface {
+                conn,
+                win,
+                gc,
+                depth,
+                bytes_per_pixel,
+                wire_stride,
+                scanline_pad,
+                chan,
+                screensaver,
+                covered: false,
+                max_req_bytes,
+            }),
             var: Var { xres, yres },
             backing,
-            max_req_bytes,
+            said,
         })
+    }
+
+    /// A white `xres` by `yres` surface with no server behind it: every draw
+    /// lands in `backing` as it would on the device, and `send_update`
+    /// presents to nothing.
+    pub fn offscreen(xres: u32, yres: u32) -> Self {
+        Self {
+            surface: None,
+            var: Var { xres, yres },
+            backing: vec![0xFFu8; xres as usize * yres as usize * CH],
+            said: String::new(),
+        }
+    }
+
+    /// What the surface resolved to, for the log's header block.
+    pub fn describe(&self) -> &str {
+        &self.said
     }
 
     /// A gray pixel (0=black, 255=white) stored as `(v,v,v)`, no-op out of range.
@@ -297,35 +423,59 @@ impl Framebuffer {
         }
     }
 
-    /// Drains the X event queue, returning whether the server asked for a redraw.
-    /// `EXPOSURE` events and `put_image` errors both arrive here.
-    pub fn pump_events(&mut self) -> bool {
-        let mut needs_repaint = false;
-        while let Ok(Some(event)) = self.conn.poll_for_event() {
-            match event {
-                Event::Expose(_) => needs_repaint = true,
-                Event::Error(e) => {
-                    // `Event::Error` sets `needs_repaint`.
-                    eprintln!("x11: WARNING request failed: {e:?}");
-                    needs_repaint = true;
-                }
-                _ => {}
-            }
+    /// Drains the X event queue through [`fold`], keeping `Surface::covered`
+    /// and resizing on a `Pump::resized`. Nothing else reads the queue, so a
+    /// loop that blocks without calling this misses an `Expose` and a relayout.
+    pub fn pump_events(&mut self) -> Pump {
+        let size = (self.var.xres, self.var.yres);
+        let Some(surface) = self.surface.as_mut() else {
+            return Pump::default();
+        };
+        let mut events = Vec::new();
+        while let Ok(Some(event)) = surface.conn.poll_for_event() {
+            events.push(event);
         }
-        needs_repaint
+        let pump = fold(&events, surface.screensaver, surface.covered, size);
+        if let Some(covered) = pump.covered {
+            surface.covered = covered;
+        }
+        if let Some((w, h)) = pump.resized {
+            self.resize(w, h);
+        }
+        pump
+    }
+
+    /// Draws `w` by `h`: `var`, `backing` and `Surface::wire_stride` follow,
+    /// and `backing` is left white for the caller's full repaint.
+    fn resize(&mut self, w: u32, h: u32) {
+        eprintln!(
+            "fb: laid out {w}x{h}, was {}x{}",
+            self.var.xres, self.var.yres
+        );
+        self.var = Var { xres: w, yres: h };
+        self.backing = vec![0xFFu8; w as usize * h as usize * CH];
+        if let Some(surface) = self.surface.as_mut() {
+            surface.wire_stride =
+                wire_stride(w as usize * surface.bytes_per_pixel, surface.scanline_pad);
+        }
     }
 
     /// Presents the rows of `rect`, converting the backing to the wire pixel
     /// format per band. `waveform` is ignored.
     pub fn send_update(&mut self, rect: MxcfbRect, _waveform: u32) -> Result<u32> {
-        let bpp = self.bytes_per_pixel;
         let xres = self.var.xres as usize;
         let bk_stride = xres * CH; // backing bytes per scanline (RGB)
-        let wire_stride = self.wire_stride; // wire bytes per scanline, padded
         let width = self.var.xres as u16;
         let top = rect.top.min(self.var.yres);
         let bottom = rect.top.saturating_add(rect.height).min(self.var.yres);
-        let max_rows = (self.max_req_bytes.saturating_sub(64) / wire_stride.max(1)).max(1);
+        // Offscreen: the draw already landed in `backing`, which is the whole
+        // of what a preview or a test reads.
+        let Some(surface) = self.surface.as_ref() else {
+            return Ok(0);
+        };
+        let bpp = surface.bytes_per_pixel;
+        let wire_stride = surface.wire_stride; // wire bytes per scanline, padded
+        let max_rows = (surface.max_req_bytes.saturating_sub(64) / wire_stride.max(1)).max(1);
 
         // `wire` is reused across bands.
         let mut wire: Vec<u8> = Vec::new();
@@ -341,20 +491,21 @@ impl Framebuffer {
                 xres,
                 bpp,
                 wire_stride,
-                self.chan,
+                surface.chan,
             );
 
-            self.conn
+            surface
+                .conn
                 .put_image(
                     ImageFormat::Z_PIXMAP,
-                    self.win,
-                    self.gc,
+                    surface.win,
+                    surface.gc,
                     width,
                     h as u16,
                     0,
                     y as i16,
                     0,
-                    self.depth,
+                    surface.depth,
                     &wire,
                 )
                 .context("put_image")?;
@@ -362,7 +513,8 @@ impl Framebuffer {
         }
         // `get_input_focus` round-trips past `flush`; its `reply` marks the batch
         // processed and delivers any error the batch raised.
-        self.conn
+        surface
+            .conn
             .get_input_focus()
             .context("sync round-trip")?
             .reply()
@@ -375,8 +527,8 @@ impl Framebuffer {
         self.backing.clone()
     }
 
-    /// A [`Framebuffer::snapshot`] back into the backing, no-op on a size mismatch.
-    /// [`Framebuffer::send_update`] presents it.
+    /// A [`Framebuffer::backing_snapshot`] back into the backing, no-op on a
+    /// size mismatch. [`Framebuffer::send_update`] presents it.
     pub fn restore_backing(&mut self, snap: Vec<u8>) {
         if snap.len() == self.backing.len() {
             self.backing = snap;
@@ -396,14 +548,205 @@ impl Framebuffer {
 impl Drop for Framebuffer {
     fn drop(&mut self) {
         // `destroy_window` hands the screen back to the WM.
-        let _ = self.conn.destroy_window(self.win);
-        let _ = self.conn.flush();
+        if let Some(surface) = self.surface.as_ref() {
+            let _ = surface.conn.destroy_window(surface.win);
+            let _ = surface.conn.flush();
+        }
     }
 }
 
 #[cfg(test)]
-mod scanline_tests {
-    use super::{pack_band, wire_stride};
+mod tests {
+    use super::{CH, Framebuffer, Pump, fold, pack_band, wire_stride};
+    use x11rb::protocol::Event;
+    use x11rb::protocol::xproto::{
+        ClientMessageData, ClientMessageEvent, ConfigureNotifyEvent, ExposeEvent, Visibility,
+        VisibilityNotifyEvent,
+    };
+
+    /// The size being drawn, as `pump_events` passes it.
+    const SIZE: (u32, u32) = (1264, 1680);
+
+    /// The atom under test. Any non-zero value stands for `lab126_screen_saver`.
+    const SS: u32 = 42;
+
+    fn visibility(state: Visibility) -> Event {
+        Event::VisibilityNotify(VisibilityNotifyEvent {
+            response_type: 15,
+            sequence: 0,
+            window: 1,
+            state,
+        })
+    }
+
+    /// A `ClientMessage` under `type_`, carrying `up` in `data8[0]`.
+    fn message(type_: u32, up: u8) -> Event {
+        let mut data = [0u8; 20];
+        data[0] = up;
+        Event::ClientMessage(ClientMessageEvent {
+            response_type: 33,
+            format: 8,
+            sequence: 0,
+            window: 1,
+            type_,
+            data: ClientMessageData::from(data),
+        })
+    }
+
+    /// A `ConfigureNotify` laying the window out at `w` by `h`.
+    fn configure(w: u16, h: u16) -> Event {
+        Event::ConfigureNotify(ConfigureNotifyEvent {
+            response_type: 22,
+            sequence: 0,
+            event: 1,
+            window: 1,
+            above_sibling: 0,
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+            border_width: 0,
+            override_redirect: false,
+        })
+    }
+
+    fn expose() -> Event {
+        Event::Expose(ExposeEvent {
+            response_type: 12,
+            sequence: 0,
+            window: 1,
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            count: 0,
+        })
+    }
+
+    /// An empty queue asks for nothing; an `Expose` asks for a repaint alone.
+    #[test]
+    fn nothing_drained_changes_nothing() {
+        assert_eq!(fold(&[], SS, false, SIZE), Pump::default());
+        let pump = fold(&[expose()], SS, false, SIZE);
+        assert!(pump.repaint);
+        assert_eq!(pump.resized, None);
+        assert_eq!(pump.covered, None);
+    }
+
+    /// A layout differing from `size` is reported, and one matching it is not.
+    /// A zero-sided layout is not a size to draw at.
+    #[test]
+    fn only_a_new_layout_is_reported() {
+        assert_eq!(
+            fold(&[configure(1680, 1264)], SS, false, SIZE).resized,
+            Some((1680, 1264))
+        );
+        assert_eq!(
+            fold(&[configure(1264, 1680)], SS, false, SIZE).resized,
+            None
+        );
+        assert_eq!(fold(&[configure(0, 0)], SS, false, SIZE).resized, None);
+    }
+
+    /// The last `ConfigureNotify` of a drain wins, so a drain ending back at
+    /// `size` reports nothing.
+    #[test]
+    fn the_last_layout_of_a_drain_wins() {
+        let events = [configure(1680, 1264), configure(1264, 1680)];
+        assert_eq!(fold(&events, SS, false, SIZE).resized, None);
+        let events = [configure(1264, 1680), configure(1680, 1264)];
+        assert_eq!(fold(&events, SS, false, SIZE).resized, Some((1680, 1264)));
+    }
+
+    /// `visibility` and `message` each cover the window on their own — the
+    /// passcode and the ads screen come over this app one way or the other.
+    #[test]
+    fn either_signal_covers_the_window() {
+        for events in [
+            vec![visibility(Visibility::FULLY_OBSCURED)],
+            vec![message(SS, 1)],
+        ] {
+            assert_eq!(fold(&events, SS, false, SIZE).covered, Some(true));
+        }
+    }
+
+    /// `UNOBSCURED` and `PARTIALLY_OBSCURED` both fold to a `covered` of false.
+    #[test]
+    fn a_partly_covered_window_keeps_the_screen() {
+        for state in [Visibility::UNOBSCURED, Visibility::PARTIALLY_OBSCURED] {
+            assert_eq!(
+                fold(&[visibility(state)], SS, true, SIZE).covered,
+                Some(false)
+            );
+            assert_eq!(fold(&[visibility(state)], SS, false, SIZE).covered, None);
+        }
+    }
+
+    /// An event repeating the `covered` passed in folds to `None`.
+    #[test]
+    fn an_unchanged_state_is_not_reported() {
+        let covered = [visibility(Visibility::FULLY_OBSCURED), message(SS, 1)];
+        assert_eq!(fold(&covered, SS, true, SIZE).covered, None);
+        assert_eq!(fold(&[message(SS, 0)], SS, false, SIZE).covered, None);
+    }
+
+    /// The last event of `events` sets `Pump::covered`.
+    #[test]
+    fn the_last_event_of_a_drain_wins() {
+        let events = [
+            visibility(Visibility::FULLY_OBSCURED),
+            expose(),
+            visibility(Visibility::UNOBSCURED),
+        ];
+        let pump = fold(&events, SS, false, SIZE);
+        assert_eq!(pump.covered, None, "it ended where it started");
+        assert!(pump.repaint);
+
+        let events = [message(SS, 1), message(SS, 0), message(SS, 1)];
+        assert_eq!(fold(&events, SS, false, SIZE).covered, Some(true));
+    }
+
+    /// A `type_` other than `screensaver`, and a `screensaver` of 0, fold to
+    /// `None`.
+    #[test]
+    fn a_message_under_another_atom_is_ignored() {
+        assert_eq!(fold(&[message(SS + 1, 1)], SS, false, SIZE).covered, None);
+        assert_eq!(fold(&[message(0, 1)], 0, false, SIZE).covered, None);
+    }
+
+    /// A `data8[0]` of 0 leaves a covered window covered: `UNOBSCURED` alone
+    /// uncovers it.
+    #[test]
+    fn only_visibility_uncovers() {
+        assert_eq!(fold(&[message(SS, 0)], SS, true, SIZE).covered, None);
+        let events = [message(SS, 1), message(SS, 0)];
+        assert_eq!(fold(&events, SS, false, SIZE).covered, Some(true));
+        let events = [message(SS, 0), visibility(Visibility::UNOBSCURED)];
+        assert_eq!(fold(&events, SS, true, SIZE).covered, Some(false));
+    }
+
+    /// `backing` holds `xres * yres * CH` across a resize. `send_update` slices
+    /// it by `var`, and a short `backing` panics there.
+    #[test]
+    fn a_resize_keeps_the_backing_in_step() {
+        let mut fb = Framebuffer::offscreen(1680, 1264);
+        for (w, h) in [(1264u32, 1680u32), (1680, 1264), (600, 800)] {
+            fb.resize(w, h);
+            assert_eq!((fb.var.xres, fb.var.yres), (w, h));
+            assert_eq!(fb.backing.len(), w as usize * h as usize * CH);
+        }
+    }
+
+    /// An offscreen [`Framebuffer`] presents to nothing and drains no queue.
+    #[test]
+    fn an_offscreen_surface_presents_to_nothing() {
+        let mut fb = Framebuffer::offscreen(600, 800);
+        fb.fill_rect(0, 0, 600, 800, 0x00);
+        assert_eq!(fb.send_update(super::MxcfbRect::default(), 0).unwrap(), 0);
+        assert_eq!(fb.pump_events(), Pump::default());
+        // The draw still landed: `backing` is what a preview reads.
+        assert!(fb.backing.iter().all(|b| *b == 0x00));
+    }
 
     /// `wire_stride` over the shipped panel widths at both `bytes_per_pixel` a
     /// Kindle X server offers, under a 4-byte pad.

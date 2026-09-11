@@ -55,7 +55,6 @@ pub fn parse(html: &str) -> Result<BookPage, ParseError> {
         .trim()
         .to_string();
 
-    // `None` where the page carries no `_EBOK_portrait.jpg`.
     let thumbnail = html
         .find("_EBOK_portrait.jpg")
         .and_then(|at| {

@@ -17,7 +17,6 @@ where
     for token in text.split_whitespace() {
         let token_w = measure(token);
         if token_w > max_width {
-            // A token past `max_width` breaks at char boundaries.
             if !current.is_empty() {
                 lines.push(std::mem::take(&mut current));
                 current_w = 0;
@@ -35,7 +34,6 @@ where
             continue;
         }
 
-        // Appended after a space, or opening a new line.
         let prefix_w = if current.is_empty() { 0 } else { space_w };
         if current_w + prefix_w + token_w > max_width && !current.is_empty() {
             lines.push(std::mem::take(&mut current));
@@ -70,7 +68,6 @@ where
     if lines.len() > max_lines {
         lines.truncate(max_lines);
         if let Some(last) = lines.last_mut() {
-            // Trim until `"<last>…"` fits `max_width`.
             let mut candidate = format!("{last}…");
             while !last.is_empty() && measure(&candidate) > max_width {
                 last.pop();
