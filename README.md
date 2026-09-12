@@ -30,5 +30,5 @@ A local `./build.sh` stages the same two under `device/`.
 
 <p align="center">
     <img src=".github/assets/steb-home.png" height="500" />
-    <img src=".github/assets/steb-search.png" height="500" />
+    <img src=".github/assets/steb-options.png" height="500" />
 </p>
