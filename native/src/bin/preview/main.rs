@@ -15,7 +15,7 @@ use steb_native::ui::filter::Filters;
 use steb_native::ui::scale::Scale;
 use steb_native::ui::sort::SortState;
 use steb_native::ui::text::TextRenderer;
-use steb_native::ui::{diag, filtermenu, grid, pager, search, searchbar, sortmenu, toast};
+use steb_native::ui::{diag, grid, options, pager, search, searchbar, toast};
 
 /// `main::FONT_PX`: the body size as a design pixel, which `ui::scale` maps to
 /// each panel the way the app does.
@@ -52,12 +52,13 @@ const SHOTS: &[&str] = &[
     "search:empty",
     "search:typed",
     "search:composing",
-    "filtermenu",
-    "filtermenu:selected",
-    "sortmenu",
-    "sortmenu:with-query",
+    "options",
+    "options:selected",
+    "options:with-query",
+    "options:no-bokai",
     "toast:hint",
     "toast:downloading",
+    "toast:installing",
     "toast:progress",
     "toast:done",
     "diag:offline",
@@ -193,26 +194,27 @@ fn draw(fb: &mut Framebuffer, renderer: &mut TextRenderer, shot: &str) -> Result
         "search:empty" => search::render_screen(fb, renderer, "", ""),
         "search:typed" => search::render_screen(fb, renderer, "middlemarch", ""),
         "search:composing" => search::render_screen(fb, renderer, "中", "guo"),
-        "filtermenu" => {
-            let tags = tags();
-            filtermenu::render_screen(fb, renderer, &tags, &Filters::default(), 0);
-        }
-        "filtermenu:selected" => {
-            let tags = tags();
+        "options" => options_screen(fb, renderer, Filters::default(), Some("0.2.0"), false),
+        "options:selected" => {
             let mut filters = Filters::default();
-            for tag in ["Adventure", "Gothic", "Poetry"] {
+            for tag in ["adventure", "gothic", "poetry"] {
                 filters.toggle(tag);
             }
-            filtermenu::render_screen(fb, renderer, &tags, &filters, 0);
+            options_screen(fb, renderer, filters, Some("0.2.0"), false);
         }
-        "sortmenu" => sortmenu::render_screen(fb, renderer, SortState::default(), false),
-        "sortmenu:with-query" => sortmenu::render_screen(fb, renderer, SortState::default(), true),
+        "options:with-query" => {
+            options_screen(fb, renderer, Filters::default(), Some("0.2.0"), true)
+        }
+        "options:no-bokai" => options_screen(fb, renderer, Filters::default(), None, false),
         "toast:hint" => {
             grid_screen(fb, renderer, layout, true, 0, 0);
             toast::draw(fb, renderer, "Hold cover to download");
         }
         "toast:downloading" => {
             toast::draw_download(fb, renderer, "Middlemarch", "Fetching…");
+        }
+        "toast:installing" => {
+            toast::draw_download(fb, renderer, "bokai", "Downloading  62%");
         }
         "toast:progress" => {
             toast::draw_progress(fb, renderer, "Middlemarch", 3, 8);
@@ -230,6 +232,35 @@ fn draw(fb: &mut Framebuffer, renderer: &mut TextRenderer, shot: &str) -> Result
 
 fn tags() -> Vec<String> {
     fixture::TAGS.iter().map(|t| t.to_string()).collect()
+}
+
+/// The `options` page, over the fixture vocabulary. `bokai` is what the
+/// About section reports, without running the converter to ask it.
+fn options_screen(
+    fb: &mut Framebuffer,
+    renderer: &mut TextRenderer,
+    mut filters: Filters,
+    bokai: Option<&str>,
+    has_query: bool,
+) {
+    let tags = tags();
+    let about = options::About {
+        steb: env!("CARGO_PKG_VERSION").to_string(),
+        bokai: bokai.map(str::to_string),
+    };
+    let mut sort = match filters.is_empty() {
+        true => SortState::default(),
+        // A page that shows a selection shows a sort picked too.
+        false => SortState(Some(steb_native::se::url::Sort::Newest)),
+    };
+    let settings = options::Settings {
+        tags: &tags,
+        filters: &mut filters,
+        sort: &mut sort,
+        has_query,
+        about: &about,
+    };
+    options::render_screen(fb, renderer, &settings, 0);
 }
 
 /// The whole grid view: search bar, a page of cells, the toolbar.

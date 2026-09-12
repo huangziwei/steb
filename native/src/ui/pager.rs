@@ -1,6 +1,10 @@
-//! The grid's control bar, a [`crate::ui::strip`]: `[ Exit ]`, `[ Filter ]`,
-//! `[ Sort ]`, then paging across the rest. [`Zones`] places the four and
-//! [`hit`] answers from the same placement [`draw`] draws at.
+//! The grid's control bar, a [`crate::ui::strip`]: `[ Exit ]`, `[ Options ]`,
+//! then paging across the rest. [`Zones`] places the three and [`hit`] answers
+//! from the same placement [`draw`] draws at.
+//!
+//! Subjects and sorting are two sections of [`crate::ui::options`] rather than
+//! two slots of their own: a bar of four named zones leaves a page turn a
+//! sliver wide on the narrow panels.
 
 use crate::eink::fb::Framebuffer;
 use crate::ui::scale::Scale;
@@ -12,18 +16,17 @@ pub fn strip_h(fb_xres: u32) -> u32 {
     strip::h(fb_xres)
 }
 
-const EXIT_ZONE_W: u32 = 180;
-/// Right of [`EXIT_ZONE_W`]. Widest: its label carries a count.
-const FILTER_ZONE_W: u32 = 260;
-/// Right of [`FILTER_ZONE_W`].
-const SORT_ZONE_W: u32 = 200;
+const EXIT_ZONE_W: u32 = 200;
+/// Right of [`EXIT_ZONE_W`]. The wider of the two: its label carries the
+/// count of subjects the grid is filtered by.
+const OPTIONS_ZONE_W: u32 = 300;
 
 /// What paging keeps at the right of the bar whatever the named zones ask for:
 /// two halves a thumb can tell apart.
 const NAV_MIN_W: u32 = 240;
 /// The least the named zones shrink to. Below this `Exit` stops being
 /// tappable, and a user who cannot leave is worse off than one who cannot page.
-const FIXED_MIN_W: u32 = 300;
+const FIXED_MIN_W: u32 = 260;
 
 /// Text inset from a zone's edge, on a zone wide enough for it.
 const LABEL_INSET: u32 = 32;
@@ -31,7 +34,6 @@ const LABEL_INSET: u32 = 32;
 /// The slot labels. An action is bracketed; paging only moves through the
 /// pages it reports and is not.
 const EXIT: &str = "[ Exit ]";
-const SORT: &str = "[ Sort ]";
 const PREV: &str = "← Prev";
 const NEXT: &str = "Next →";
 
@@ -42,15 +44,13 @@ const LABEL_PX: &[f32] = &[32.0, 28.0, 24.0, 20.0, 17.0];
 /// Reference panel width for the layouts checked against one.
 pub const NARROWEST_PANEL_W: u32 = 600;
 
-/// Where the toolbar's zones start. The named three hold their own widths
-/// while that leaves [`NAV_MIN_W`] for paging, and shrink together, in
-/// proportion, where it does not.
+/// Where the toolbar's zones start. The named two hold their own widths while
+/// that leaves [`NAV_MIN_W`] for paging, and shrink together, in proportion,
+/// where it does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Zones {
-    /// Left edge of `Filter`. `Exit` runs from 0 to here.
-    pub filter: u32,
-    /// Left edge of `Sort`.
-    pub sort: u32,
+    /// Left edge of `Options`. `Exit` runs from 0 to here.
+    pub options: u32,
     /// Left edge of the page-nav region.
     pub nav: u32,
     /// Where `Prev` gives way to `Next`.
@@ -60,20 +60,17 @@ pub struct Zones {
 impl Zones {
     pub fn compute(fb_xres: u32) -> Self {
         let s = Scale::of_width(fb_xres);
-        let (exit_w, filter_w, sort_w) =
-            (s.px(EXIT_ZONE_W), s.px(FILTER_ZONE_W), s.px(SORT_ZONE_W));
-        let fixed_w = (exit_w + filter_w + sort_w).max(1);
+        let (exit_w, options_w) = (s.px(EXIT_ZONE_W), s.px(OPTIONS_ZONE_W));
+        let fixed_w = (exit_w + options_w).max(1);
         let room = fb_xres
             .saturating_sub(s.px(NAV_MIN_W))
             .clamp(s.px(FIXED_MIN_W).min(fixed_w), fixed_w);
-        let filter = exit_w * room / fixed_w;
-        let sort = filter + filter_w * room / fixed_w;
+        let options = exit_w * room / fixed_w;
         // `min`: a panel narrower than [`FIXED_MIN_W`] plus [`NAV_MIN_W`] has
         // no nav region, and `hit` answers `None` past the named zones.
-        let nav = (sort + sort_w * room / fixed_w).min(fb_xres);
+        let nav = (options + options_w * room / fixed_w).min(fb_xres);
         Self {
-            filter,
-            sort,
+            options,
             nav,
             nav_mid: (nav + fb_xres) / 2,
         }
@@ -94,8 +91,7 @@ fn inset_for(zone_w: u32, s: Scale) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PagerHit {
     Exit,
-    Filter,
-    Sort,
+    Options,
     /// The nav region's left and right half.
     Prev,
     Next,
@@ -116,14 +112,11 @@ pub fn hit(tx: u32, ty: u32, fb_xres: u32, fb_yres: u32, total_pages: usize) -> 
         return None;
     }
     let z = Zones::compute(fb_xres);
-    if tx < z.filter {
+    if tx < z.options {
         return Some(PagerHit::Exit);
     }
-    if tx < z.sort {
-        return Some(PagerHit::Filter);
-    }
     if tx < z.nav {
-        return Some(PagerHit::Sort);
+        return Some(PagerHit::Options);
     }
     if total_pages <= 1 {
         return None;
@@ -165,9 +158,10 @@ pub fn draw(
     let s = Scale::of_width(xres);
     let strip_y = strip::base(fb);
     let z = Zones::compute(xres);
-    let filter_label = match filter_count {
-        0 => "[ Filter ]".to_string(),
-        n => format!("[ Filter ({n}) ]"),
+    // The count of subjects `options` filters the grid by.
+    let options_label = match filter_count {
+        0 => "[ Options ]".to_string(),
+        n => format!("[ Options ({n}) ]"),
     };
     let counter = format!("{} / {}", page + 1, total_pages);
 
@@ -177,9 +171,8 @@ pub fn draw(
     let px = label_px(
         renderer,
         &[
-            (EXIT, Zones::width(0, z.filter)),
-            (&filter_label, Zones::width(z.filter, z.sort)),
-            (SORT, Zones::width(z.sort, z.nav)),
+            (EXIT, Zones::width(0, z.options)),
+            (&options_label, Zones::width(z.options, z.nav)),
             (PREV, nav_half),
             (NEXT, nav_half),
         ],
@@ -190,23 +183,14 @@ pub fn draw(
         // Inside `at_px`, so the metrics the baseline is centred on are the
         // ones this size actually draws with.
         let baseline = strip::baseline(xres, strip_y, r);
-        strip::label(fb, r, 0, z.filter, baseline, EXIT, false);
+        strip::label(fb, r, 0, z.options, baseline, EXIT, false);
         strip::label(
             fb,
             r,
-            z.filter,
-            Zones::width(z.filter, z.sort),
+            z.options,
+            Zones::width(z.options, z.nav),
             baseline,
-            &filter_label,
-            false,
-        );
-        strip::label(
-            fb,
-            r,
-            z.sort,
-            Zones::width(z.sort, z.nav),
-            baseline,
-            SORT,
+            &options_label,
             false,
         );
 
@@ -241,7 +225,7 @@ pub fn draw(
     // Separators last: a label that ran long is cut by its own zone edge rather
     // than reading as part of the next one. One to the left of each *live*
     // zone, so a single page leaves no empty compartment behind.
-    for (edge, live) in [(z.filter, true), (z.sort, true), (z.nav, total_pages > 1)] {
+    for (edge, live) in [(z.options, true), (z.nav, total_pages > 1)] {
         if live {
             strip::separator(fb, edge);
         }
@@ -267,8 +251,8 @@ mod tests {
     fn every_fixed_zone_is_reachable_on_the_narrowest_panel() {
         let z = Zones::compute(XRES);
         assert_eq!(tap(2, 1), Some(PagerHit::Exit));
-        assert_eq!(tap(z.filter + 2, 1), Some(PagerHit::Filter));
-        assert_eq!(tap(z.sort + 2, 1), Some(PagerHit::Sort));
+        assert_eq!(tap(z.options + 2, 1), Some(PagerHit::Options));
+        assert_eq!(tap(z.nav - 2, 1), Some(PagerHit::Options));
     }
 
     #[test]
@@ -285,11 +269,25 @@ mod tests {
     fn the_named_zones_always_leave_room_to_page() {
         for &xres in PANELS {
             let z = Zones::compute(xres);
-            assert!(z.filter < z.sort, "{xres}: filter/sort collapsed");
-            assert!(z.sort < z.nav, "{xres}: sort/nav collapsed");
+            assert!(z.options > 0, "{xres}: no Exit zone");
+            assert!(z.options < z.nav, "{xres}: options/nav collapsed");
             assert!(
                 z.nav < z.nav_mid && z.nav_mid < xres,
                 "{xres}: no nav halves"
+            );
+        }
+    }
+
+    /// Two named zones instead of four leave the page turn a thumb's width at
+    /// every panel in the fleet.
+    #[test]
+    fn paging_keeps_its_own_region_on_every_panel() {
+        for &xres in PANELS {
+            let z = Zones::compute(xres);
+            let nav_w = xres - z.nav;
+            assert!(
+                nav_w >= Scale::of_width(xres).px(NAV_MIN_W),
+                "{xres}: {nav_w}px to page in"
             );
         }
     }

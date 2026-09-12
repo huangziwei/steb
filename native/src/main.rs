@@ -1,9 +1,8 @@
 //! Steb — search Standard Ebooks from the Kindle and download the `.azw3`. One
-//! paginated cover grid; `search`, `filtermenu` and `sortmenu` open as
-//! blocking sub-loops. A held cover downloads, then `convert` writes a `.kfx`.
+//! paginated cover grid; `search` and `options` open as blocking sub-loops. A
+//! held cover downloads, then `convert` writes a `.kfx`.
 
-// This crate root compiles the same files as `lib.rs`, where the preview and
-// the tests call what the run loop does not.
+// This crate root compiles the same files as `lib.rs`.
 #![allow(dead_code)]
 
 mod cache;
@@ -11,8 +10,10 @@ mod convert;
 mod cover_cache;
 mod eink;
 mod font;
+mod install;
 mod keyboard;
 mod lipc;
+mod logging;
 mod net;
 mod orientation;
 mod se;
@@ -20,6 +21,8 @@ mod ui;
 mod wrap;
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use eink::buttons::{Buttons, PageButton};
@@ -27,14 +30,16 @@ use eink::fb::{Framebuffer, MxcfbRect, WAVEFORM_MODE_DU, WAVEFORM_MODE_GC16};
 use eink::input::{Input, InputEvent};
 use eink::touch::{SwipeDir, Touch, TouchEvent, classify_swipe};
 use image::DynamicImage;
+use logging::log;
 
 use se::listing::Hit;
 use se::url::{Endpoint, Listing};
 use ui::filter::Filters;
+use ui::options;
 use ui::scale::Scale;
 use ui::sort::SortState;
 use ui::text::TextRenderer;
-use ui::{diag, filtermenu, grid, pager, search, searchbar, toast};
+use ui::{diag, grid, pager, search, searchbar, toast};
 
 /// Extension bundle root, holding `crate::cache`.
 const BUNDLE_DIR: &str = "/mnt/us/extensions/steb";
@@ -45,8 +50,8 @@ const THUMBNAILS_DIR: &str = "/mnt/us/system/thumbnails";
 /// Where `bin/steb.sh` funnels this process's stderr.
 const LOG_PATH: &str = "/mnt/us/logs/steb.log";
 
-/// Body size, a design pixel at [`Scale::DESIGN_DPI`]: [`font_px`] takes it to
-/// the panel's own density.
+/// Body size, a design pixel at [`Scale::DESIGN_DPI`]; `Scale::font` maps it
+/// to the panel.
 const FONT_PX: f32 = 32.0;
 /// The grid as it fits the panel `fb` is drawing at.
 fn layout_for(fb: &Framebuffer) -> grid::Layout {
@@ -61,8 +66,8 @@ fn layout_for(fb: &Framebuffer) -> grid::Layout {
 /// How long a cover must be held, within [`ARM_SLOP_PX`], before its download
 /// arms and fires. A tap downloads nothing.
 const ARM_THRESHOLD: Duration = Duration::from_millis(1000);
-/// Max drift, either axis, across a hold. A design pixel, so the slop is the
-/// same physical distance on every panel.
+/// Max drift, either axis, across a hold. A design pixel, one physical
+/// distance on every panel.
 const ARM_SLOP_PX: u32 = 40;
 
 /// [`ARM_SLOP_PX`] on a panel `fb_xres` wide.
@@ -75,6 +80,13 @@ const ARM_DWELL: Duration = Duration::from_millis(250);
 const TOAST_LINGER: Duration = Duration::from_millis(1200);
 /// What [`download`] reports when the Cancel button was tapped.
 const CANCELLED: &str = "Cancelled";
+
+/// How long [`fetch`]'s closing banner holds the panel.
+const INSTALL_LINGER: Duration = Duration::from_millis(2600);
+/// Floor between [`fetch`]'s banner repaints, each a full-banner GC16.
+const BANNER_INTERVAL: Duration = Duration::from_millis(700);
+/// Gap between `input` polls while [`fetch`]'s worker thread runs.
+const WORKER_POLL: Duration = Duration::from_millis(250);
 
 /// Refresh rect for one grid cell.
 fn cell_rect(layout: grid::Layout, cell_x: i32, cell_y: i32) -> MxcfbRect {
@@ -96,19 +108,6 @@ struct Armed {
     down_at: Instant,
     /// Where the finger landed, against [`ARM_SLOP_PX`].
     at: (u32, u32),
-}
-
-/// One line to stderr, which `bin/steb.sh` redirects into [`LOG_PATH`].
-/// Never [`LOG_PATH`] directly: that doubles every line.
-fn log(msg: impl AsRef<str>) {
-    eprintln!("[{}] {}", now(), msg.as_ref());
-}
-
-fn now() -> String {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs().to_string())
-        .unwrap_or_else(|_| "?".into())
 }
 
 /// What the grid draws. `hits` accumulates across SE pages; `pager` pages that
@@ -191,9 +190,8 @@ fn with_diag<T>(
     }
 }
 
-/// The `Tick` of a blocking step: drains the X queue so a window put over this
-/// app mid-download still reaches [`Input::set_covered`], and retakes the grab
-/// when it goes. Draws nothing — the banner on the panel is still the banner.
+/// The `Tick` of a blocking step: drains the X queue into
+/// [`Input::set_covered`] and retakes the grab. Draws nothing.
 fn working_tick(fb: &mut Framebuffer, input: &mut Input) {
     let pump = fb.pump_events();
     if let Some(covered) = pump.covered {
@@ -202,8 +200,8 @@ fn working_tick(fb: &mut Framebuffer, input: &mut Input) {
     input.retake();
 }
 
-/// [`working_tick`], then whether `cancel` was tapped. The screenshot gesture
-/// is honoured here too: it is the one gesture that must work mid-download.
+/// [`working_tick`], then whether `cancel` was tapped.
+/// `TouchEvent::Screenshot` is answered here too.
 fn working_poll(
     fb: &mut Framebuffer,
     input: &mut Input,
@@ -419,8 +417,8 @@ fn download(
     let (rect, cancel) = toast::draw_download(fb, renderer, &hit.title, "Fetching…");
     fb.send_update(rect, WAVEFORM_MODE_GC16)?;
 
-    // `bytes` and `text` are each one blocking call, so between them is the
-    // only seam: a cover is noticed here, the grab released, a Cancel read.
+    // `bytes` and `text` are each one blocking call; this is the seam between
+    // them.
     if working_poll(fb, input, cancel)? {
         return Ok(CANCELLED.to_string());
     }
@@ -455,8 +453,7 @@ fn download(
         Err(e) => return Ok(format!("Failed: {e}")),
     };
 
-    // Past the write the book is on the device, so there is nothing left to
-    // cancel. The drain still runs.
+    // Past `se::download::commit` there is nothing left to cancel.
     working_tick(fb, input);
 
     // `ThumbnailHref::file_name` is written verbatim. A failure leaves the
@@ -513,12 +510,103 @@ fn finish(file_name: &str) -> String {
     format!("Downloaded {file_name}")
 }
 
-/// Writes the X/eink dump [`eink::xprobe`] collects, then exits. It opens no
-/// framebuffer and draws nothing, so it is a flag and never a screen.
+/// Whatever is on the panel left there for `how_long`, with [`working_tick`]
+/// draining the X queue.
+fn hold(fb: &mut Framebuffer, input: &mut Input, how_long: Duration) {
+    let until = Instant::now() + how_long;
+    while Instant::now() < until {
+        working_tick(fb, input);
+        std::thread::sleep(Duration::from_millis(60));
+    }
+}
+
+/// One [`install::Source`] fetched behind the download banner.
+///
+/// [`install::run`] blocks on a worker thread; this loop repaints the banner,
+/// answers Cancel, and returns [`install::Outcome::is_installed`].
+fn fetch(
+    fb: &mut Framebuffer,
+    input: &mut Input,
+    renderer: &mut TextRenderer,
+    source: &'static install::Source,
+) -> anyhow::Result<bool> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let flag = Arc::clone(&cancel);
+    let worker = std::thread::spawn(move || {
+        install::run(source, &flag, &move |detail| {
+            let _ = tx.send(detail);
+        })
+    });
+
+    let mut detail = "Asking GitHub…".to_string();
+    let (rect, cancel_rect) = toast::draw_download(fb, renderer, source.name, &detail);
+    fb.send_update(rect, WAVEFORM_MODE_GC16)?;
+    let mut painted = Instant::now();
+    let mut stale = false;
+
+    loop {
+        while let Ok(line) = rx.try_recv() {
+            detail = line;
+            stale = true;
+        }
+        if stale && painted.elapsed() >= BANNER_INTERVAL {
+            let (rect, _) = toast::draw_download(fb, renderer, source.name, &detail);
+            fb.send_update(rect, WAVEFORM_MODE_GC16)?;
+            painted = Instant::now();
+            stale = false;
+        }
+        // Every line is drained above before this is read.
+        if worker.is_finished() {
+            break;
+        }
+
+        match input.next_deadline(Some(Instant::now() + WORKER_POLL))? {
+            InputEvent::Touch(TouchEvent::Up { x, y })
+                if !cancel.load(Ordering::Relaxed) && toast::in_rect(cancel_rect, x, y) =>
+            {
+                // Whatever is in flight stops at its next chunk.
+                cancel.store(true, Ordering::Relaxed);
+                log(format!("{}: cancelled", source.name));
+                let rect =
+                    toast::draw_download_done(fb, renderer, &format!("{}\nStopping…", source.name));
+                fb.send_update(rect, WAVEFORM_MODE_GC16)?;
+                painted = Instant::now();
+                stale = false;
+            }
+            InputEvent::Touch(TouchEvent::Screenshot) => {
+                let _ = eink::screenshot::capture(fb);
+            }
+            _ => working_tick(fb, input),
+        }
+    }
+
+    let outcome = worker
+        .join()
+        .unwrap_or(install::Outcome::Failed(install::Failure::NotPlaced));
+    let message = outcome.message(source);
+    log(message.replace('\n', " — "));
+    let rect = toast::draw_download_done(fb, renderer, &message);
+    fb.send_update(rect, WAVEFORM_MODE_GC16)?;
+    hold(fb, input, INSTALL_LINGER);
+    Ok(outcome.is_installed())
+}
+
+/// Writes the X/eink dump [`eink::xprobe`] collects, then exits. Opens no
+/// framebuffer and draws nothing.
 const PROBE_FLAG: &str = "--probe-x";
 
+/// Prints [`install::VERSION`] and exits 0, opening neither the framebuffer
+/// nor the log. `install::states_version` runs it on a staged copy.
+const VERSION_FLAG: &str = "--version";
+
 fn main() {
-    if std::env::args().skip(1).any(|a| a == PROBE_FLAG) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == VERSION_FLAG) {
+        println!("{}", install::VERSION);
+        return;
+    }
+    if args.iter().any(|a| a == PROBE_FLAG) {
         if let Err(e) = eink::xprobe::run() {
             eprintln!("xprobe: {e:#}");
             std::process::exit(1);
@@ -565,11 +653,12 @@ fn run() -> anyhow::Result<()> {
         input.describe()
     ));
 
-    // `converter` is `None` where bokai is not installed at `convert::BIN_PATH`.
-    let converter = convert::locate();
+    // `converter` is `None` where no `convert::BIN_DIR` build runs.
+    // `ui::options` can fetch one, and the grid loop re-reads it.
+    let mut converter = convert::locate();
     match &converter {
         Some(c) => log(format!("converter: {}", c.exe().display())),
-        None => log(format!("converter: none at {}", convert::BIN_PATH)),
+        None => log(format!("converter: none under {}", convert::BIN_DIR)),
     }
 
     // ---- Cache + first fetch -------------------------------------------
@@ -715,8 +804,8 @@ fn run() -> anyhow::Result<()> {
                     continue;
                 }
 
-                // A `Tick` arm clears `armed`, so one still set here was
-                // released inside [`ARM_THRESHOLD`].
+                // A `Tick` arm clears `armed`; one set here was released
+                // inside [`ARM_THRESHOLD`].
                 if let Some(a) = armed.take() {
                     log(format!(
                         "short tap ({:?}), showing hint",
@@ -755,35 +844,43 @@ fn run() -> anyhow::Result<()> {
                 if let Some(hit) = pager::hit(x, y, fb.var.xres, fb.var.yres, total_pages) {
                     match hit {
                         pager::PagerHit::Exit => return Ok(()),
-                        pager::PagerHit::Filter => {
+                        pager::PagerHit::Options => {
                             let before = (view.filters.clone(), view.sort);
                             let tags = view.tags.clone();
-                            filtermenu::run(
-                                &mut fb,
-                                &mut input,
-                                &mut renderer,
-                                &tags,
-                                &mut view.filters,
-                            )?;
+                            let has_query = view.has_query();
+                            // The page is reopened after each fetch, on
+                            // whatever landed, and closes on `Done`.
+                            loop {
+                                let about = options::About::read();
+                                let mut settings = options::Settings {
+                                    tags: &tags,
+                                    filters: &mut view.filters,
+                                    sort: &mut view.sort,
+                                    has_query,
+                                    about: &about,
+                                };
+                                let exit = options::run(
+                                    &mut fb,
+                                    &mut input,
+                                    &mut renderer,
+                                    &mut settings,
+                                )?;
+                                let options::Exit::Fetch(source) = exit else {
+                                    break;
+                                };
+                                let landed = fetch(&mut fb, &mut input, &mut renderer, source)?;
+                                // `install::place` replaced this process's
+                                // own binary.
+                                if landed && std::ptr::eq(source, &install::STEB) {
+                                    return Ok(());
+                                }
+                                converter = convert::locate();
+                            }
                             if (view.filters.clone(), view.sort) != before {
                                 view.clear_results();
                                 ensure_page!(0);
                                 page = 0;
                             }
-                            repaint!();
-                        }
-                        pager::PagerHit::Sort => {
-                            let has_query = view.has_query();
-                            filtermenu::run_sort(
-                                &mut fb,
-                                &mut input,
-                                &mut renderer,
-                                &mut view.sort,
-                                has_query,
-                            )?;
-                            view.clear_results();
-                            ensure_page!(0);
-                            page = 0;
                             repaint!();
                         }
                         pager::PagerHit::Next => next_page!(),

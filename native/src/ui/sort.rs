@@ -20,7 +20,7 @@ impl SortState {
         SortState(Some(Sort::Popularity)),
     ];
 
-    /// SE's own wording.
+    /// SE's own wording, for anywhere with a line to spare.
     pub fn label(self) -> &'static str {
         match self.0 {
             None => "Default",
@@ -33,18 +33,32 @@ impl SortState {
         }
     }
 
+    /// [`SortState::label`] cut to a chip, which is as wide as its own text:
+    /// SE's parenthesised direction would leave two chips to a line.
+    pub fn chip(self) -> &'static str {
+        match self.0 {
+            None => "Default",
+            Some(Sort::Relevance) => "Relevance",
+            Some(Sort::Newest) => "Newest",
+            Some(Sort::AuthorAlpha) => "Author a–z",
+            Some(Sort::ReadingEase) => "Easiest",
+            Some(Sort::Length) => "Shortest",
+            Some(Sort::Popularity) => "Most read",
+        }
+    }
+
     /// Whether this row is offered under `has_query`. `Relevance` is
     /// search-only.
     pub fn available(self, has_query: bool) -> bool {
         has_query || self.0 != Some(Sort::Relevance)
     }
 
-    /// The grid header line.
-    pub fn header(self) -> String {
-        match self.0 {
-            None => "Latest releases".to_string(),
-            Some(_) => self.label().to_string(),
-        }
+    /// The states offered under `has_query`, in display order.
+    pub fn offered(has_query: bool) -> Vec<SortState> {
+        SortState::ALL
+            .into_iter()
+            .filter(|s| s.available(has_query))
+            .collect()
     }
 }
 
@@ -55,7 +69,7 @@ mod tests {
     #[test]
     fn the_default_is_ses_default() {
         assert_eq!(SortState::default(), SortState(None));
-        assert_eq!(SortState::default().header(), "Latest releases");
+        assert_eq!(SortState::default().chip(), "Default");
     }
 
     #[test]
@@ -66,12 +80,26 @@ mod tests {
         for s in SortState::ALL.iter().filter(|s| **s != relevance) {
             assert!(s.available(false), "{} should always be offered", s.label());
         }
+        // Only that one row comes and goes with a query.
+        assert_eq!(SortState::offered(true).len(), SortState::ALL.len());
+        assert_eq!(SortState::offered(false).len(), SortState::ALL.len() - 1);
+        assert!(!SortState::offered(false).contains(&relevance));
+        assert_eq!(SortState::offered(true)[0], SortState::default());
     }
 
     #[test]
-    fn every_row_has_a_label() {
+    fn every_row_has_a_label_and_a_shorter_chip() {
         for s in SortState::ALL {
             assert!(!s.label().is_empty());
+            assert!(!s.chip().is_empty());
+            assert!(
+                s.chip().chars().count() <= s.label().chars().count(),
+                "{} is not shorter than {}",
+                s.chip(),
+                s.label()
+            );
+            // A chip carries no direction in brackets; that is what it drops.
+            assert!(!s.chip().contains('('), "{}", s.chip());
         }
     }
 }

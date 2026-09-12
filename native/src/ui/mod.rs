@@ -4,14 +4,14 @@
 
 pub mod diag;
 pub mod filter;
-pub mod filtermenu;
 pub mod grid;
+pub mod options;
 pub mod pager;
+pub mod panel;
 pub mod scale;
 pub mod search;
 pub mod searchbar;
 pub mod sort;
-pub mod sortmenu;
 pub mod strip;
 pub mod text;
 pub mod toast;
@@ -20,3 +20,10 @@ pub mod toast;
 /// `ui::text` stamps a glyph in one of these.
 pub const BLACK: u8 = 0x00;
 pub const WHITE: u8 = 0xFF;
+/// A line on the page to be read, not acted on: the status line under a title
+/// and the note under a row of chips.
+///
+/// `WAVEFORM_MODE_GC16` resolves 16 levels and holds this shade.
+/// `WAVEFORM_MODE_DU` is two-level and snaps it, so nothing in this shade may
+/// sit inside a DU rect.
+pub const QUIET: u8 = 0x88;

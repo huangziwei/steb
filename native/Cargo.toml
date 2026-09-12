@@ -44,5 +44,15 @@ serde_json = "1"
 ab_glyph = "0.2"
 # Cover JPEG/PNG decode and resize for the grid.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# `install::archive` inflates the deflated entries of a release zip.
+# `rust_backend` (miniz_oxide), never the default zlib: a C build script
+# anywhere in the graph ends the rust-lld cross path.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Each zip entry against the CRC the archive recorded for it. Already in the
+# graph through `image`'s PNG decoder.
+crc32fast = "1"
+# The `.sha256` sidecar published beside a release zip. Already in the graph
+# through `rustls-rustcrypto`.
+sha2 = "0.11"
 # X11 client over the socket. `allow-unsafe-code` links the system libxcb.
 x11rb = { version = "0.13", default-features = false }

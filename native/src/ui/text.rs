@@ -139,6 +139,37 @@ impl TextRenderer {
         self.draw_in(font::Script::Unknown, fb, x, y_baseline, s, inverted)
     }
 
+    /// [`TextRenderer::draw`] in an explicit shade — [`crate::ui::QUIET`] for
+    /// a line that is not a control, or either of the two `draw` picks between.
+    pub fn draw_ink(
+        &mut self,
+        fb: &mut Framebuffer,
+        x: i32,
+        y_baseline: i32,
+        s: &str,
+        ink: u8,
+    ) -> i32 {
+        self.draw_in_ink(font::Script::Unknown, fb, x, y_baseline, s, ink)
+    }
+
+    /// [`TextRenderer::draw_ink`] struck twice, a pixel apart.
+    ///
+    /// [`crate::font`] ranks upright regulars first and a device may carry no
+    /// bold cut at all, so a heading is thickened rather than set in another
+    /// face. The second strike widens the run by one pixel, which
+    /// [`TextRenderer::measure_width`] does not account for.
+    pub fn draw_bold(
+        &mut self,
+        fb: &mut Framebuffer,
+        x: i32,
+        y_baseline: i32,
+        s: &str,
+        ink: u8,
+    ) -> i32 {
+        self.draw_ink(fb, x, y_baseline, s, ink);
+        self.draw_ink(fb, x + 1, y_baseline, s, ink)
+    }
+
     /// [`TextRenderer::draw`] under a known `script`, which orders the faces
     /// tried. Coverage decides which one draws.
     pub fn draw_in(
@@ -150,7 +181,24 @@ impl TextRenderer {
         s: &str,
         inverted: bool,
     ) -> i32 {
-        let fg = if inverted { 0xFF } else { 0x00 };
+        let ink = if inverted {
+            crate::ui::WHITE
+        } else {
+            crate::ui::BLACK
+        };
+        self.draw_in_ink(script, fb, x, y_baseline, s, ink)
+    }
+
+    /// [`TextRenderer::draw_in`] in an explicit shade.
+    pub fn draw_in_ink(
+        &mut self,
+        script: font::Script,
+        fb: &mut Framebuffer,
+        x: i32,
+        y_baseline: i32,
+        s: &str,
+        fg: u8,
+    ) -> i32 {
         let selection = self.chain.select(s, script);
         let px = self.px;
         let px_key = px.to_bits();

@@ -1,5 +1,9 @@
 //! `bokai convert` over a downloaded `.azw3`, writing the `.kfx` beside it.
 //! [`locate`] returning `None` leaves the `.azw3` in place.
+//!
+//! bokai is an add-on, not a dependency: it lives in an extension folder of
+//! its own and `crate::install` fetches it from the release named by
+//! [`RELEASES_URL`].
 
 use std::fs;
 use std::io;
@@ -7,8 +11,24 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-/// The bokai binary [`locate`] probes.
-pub const BIN_PATH: &str = "/mnt/us/extensions/bokai/bin/bokai";
+/// The add-on extension's root, beside this app's under `/mnt/us/extensions`.
+pub const EXTENSION_DIR: &str = "/mnt/us/extensions/bokai";
+/// Where the release archive installs bokai's builds.
+pub const BIN_DIR: &str = "/mnt/us/extensions/bokai/bin";
+
+/// Where `crate::install` fetches it from, and what the log names when that
+/// fails and it has to be done on a computer instead.
+pub const RELEASES_URL: &str = "github.com/huangziwei/sidle/releases";
+/// The asset, `*` standing for the version. bokai versions on its own line and
+/// moves without this app moving, so no one version belongs here.
+pub const RELEASE_ASSET: &str = "bokai-*-kindle.zip";
+
+/// bokai's two builds in [`locate_in`] order: hard-float first, soft-float
+/// second. One zip carries both and a device starts one of them.
+pub const ABI_VARIANTS: [&str; 2] = ["bokai", "bokai-armsf"];
+
+/// The invocation that converts nothing and exits 0 on a build that runs here.
+const VERSION_FLAG: &str = "--version";
 
 /// How long [`Converter::convert_watched`] leaves between `try_wait` calls:
 /// short enough that a cover arriving over this app is noticed promptly.
@@ -47,16 +67,29 @@ pub struct Converter {
     exe: PathBuf,
 }
 
-/// [`locate_at`] over [`BIN_PATH`].
+/// [`locate_in`] over [`BIN_DIR`].
 pub fn locate() -> Option<Converter> {
-    locate_at(Path::new(BIN_PATH))
+    locate_in(Path::new(BIN_DIR))
 }
 
-/// `exe`, if it is a file whose `--version` exits 0.
+/// The first [`ABI_VARIANTS`] entry under `dir` that [`locate_at`] accepts.
+///
+/// Each variant targets a different float ABI, so at most one of them starts
+/// on any one device.
+pub fn locate_in(dir: &Path) -> Option<Converter> {
+    ABI_VARIANTS
+        .iter()
+        .find_map(|name| locate_at(&dir.join(name)))
+}
+
+/// `exe`, if it is a file whose [`VERSION_FLAG`] exits 0.
+///
+/// The run costs one process and rules out a build for the wrong ABI, which
+/// otherwise fails once per book with the panel mid-download.
 pub fn locate_at(exe: &Path) -> Option<Converter> {
     let ok = exe.is_file()
         && Command::new(exe)
-            .arg("--version")
+            .arg(VERSION_FLAG)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -64,6 +97,25 @@ pub fn locate_at(exe: &Path) -> Option<Converter> {
     ok.then(|| Converter {
         exe: exe.to_path_buf(),
     })
+}
+
+/// The version of the installed bokai, as it states itself.
+///
+/// `None` where nothing runnable is installed. Nothing else on the device
+/// records it, so a copy unzipped by hand reports the same as one this app
+/// fetched.
+pub fn installed_version() -> Option<String> {
+    locate().and_then(|c| c.version())
+}
+
+/// The version token of a `--version` line: `bokai 0.2.0` answers `0.2.0`.
+///
+/// clap prints `<name> <version>`, and bokai's own build stamp can put a
+/// release tag in brackets after it. The first word opening on a digit is the
+/// version in every one of those shapes.
+fn version_token(said: &str) -> Option<&str> {
+    said.split_whitespace()
+        .find(|word| word.starts_with(|c: char| c.is_ascii_digit()))
 }
 
 /// `azw3` under the [`KFX`] extension, stem unchanged.
@@ -83,6 +135,13 @@ impl Converter {
     /// The path [`Converter::convert`] spawns.
     pub fn exe(&self) -> &Path {
         &self.exe
+    }
+
+    /// What `bokai --version` states, cut to the version itself.
+    pub fn version(&self) -> Option<String> {
+        let out = Command::new(&self.exe).arg(VERSION_FLAG).output().ok()?;
+        let said = String::from_utf8_lossy(&out.stdout);
+        version_token(said.trim()).map(str::to_string)
     }
 
     /// `bokai convert -t kfx <azw3> <staged>` run to its exit, [`staging_path`]
@@ -179,11 +238,36 @@ mod tests {
     #[test]
     fn a_missing_binary_resolves_to_no_converter() {
         assert_eq!(locate_at(Path::new("/nonexistent/bokai")), None);
+        // Neither ABI build is there, so neither answers.
+        assert_eq!(locate_in(Path::new("/nonexistent/bin")), None);
+        assert_eq!(installed_version(), locate().and_then(|c| c.version()));
     }
 
     #[test]
     fn a_directory_at_the_path_resolves_to_no_converter() {
         assert_eq!(locate_at(&std::env::temp_dir()), None);
+        assert_eq!(locate_in(&std::env::temp_dir()), None);
+    }
+
+    /// One zip carries both float ABIs and a device starts one of them, so
+    /// both are probed rather than the hard-float one alone.
+    #[test]
+    fn both_abi_builds_are_probed_under_the_bin_folder() {
+        assert_eq!(ABI_VARIANTS, ["bokai", "bokai-armsf"]);
+        assert!(BIN_DIR.starts_with(EXTENSION_DIR));
+        assert_eq!(BIN_DIR, format!("{EXTENSION_DIR}/bin"));
+    }
+
+    /// Whatever shape `bokai --version` takes, the version is the first word
+    /// opening on a digit.
+    #[test]
+    fn the_version_is_read_out_of_the_line_bokai_prints() {
+        assert_eq!(version_token("bokai 0.2.0"), Some("0.2.0"));
+        // `build.rs` folds a release tag in after the version.
+        assert_eq!(version_token("bokai 0.2.0 (v0.2.0)"), Some("0.2.0"));
+        assert_eq!(version_token("bokai 0.1.10"), Some("0.1.10"));
+        assert_eq!(version_token(""), None);
+        assert_eq!(version_token("bokai"), None);
     }
 
     /// `exe` written without an execute bit.

@@ -47,6 +47,21 @@ impl Filters {
     }
 }
 
+/// A tag as a chip reads it: SE's vocabulary is slugs, and `science-fiction`
+/// on a chip should say `Science fiction`. The slug is what [`Filters`] holds
+/// and what reaches the URL; this is display only.
+pub fn display(tag: &str) -> String {
+    let mut out = String::with_capacity(tag.len());
+    for (at, ch) in tag.chars().enumerate() {
+        match (at, ch) {
+            (0, c) => out.extend(c.to_uppercase()),
+            (_, '-') => out.push(' '),
+            (_, c) => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,6 +94,18 @@ mod tests {
         f.toggle(ALL);
         assert!(f.is_empty(), "`all` means no filter, not a tag named all");
         assert!(!f.is_selected(ALL));
+    }
+
+    #[test]
+    fn a_slug_reads_as_words_on_a_chip() {
+        assert_eq!(display("science-fiction"), "Science fiction");
+        assert_eq!(display("childrens"), "Childrens");
+        assert_eq!(display("travel"), "Travel");
+        assert_eq!(display(""), "");
+        // Display only: the slug is what reaches the URL.
+        let mut f = Filters::default();
+        f.toggle("science-fiction");
+        assert_eq!(f.as_params(), vec!["science-fiction".to_string()]);
     }
 
     #[test]

@@ -7,10 +7,14 @@ pub mod convert;
 pub mod cover_cache;
 pub mod eink;
 pub mod font;
+pub mod install;
 pub mod keyboard;
 pub mod lipc;
+pub mod logging;
 pub mod net;
 pub mod orientation;
 pub mod se;
 pub mod ui;
 pub mod wrap;
+
+pub use logging::log;
