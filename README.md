@@ -1,6 +1,6 @@
 # Steb
 
-Steb is an unofficial [Standard Ebooks](https://standardebooks.org) frontend on a jailbroken Kindle. 
+Steb is an unofficial [Standard Ebooks](https://standardebooks.org) frontend for jailbroken Kindles. 
 
 Tested on Kindle Colorsoft (5.18.0.2).
 
@@ -22,7 +22,7 @@ Download and unzip the latest `steb-v<x.y.z>-kindle.zip` file from the [release 
 
 Either one launches Steb: the scriptlet as a tile in the library, the extension as a **Steb** entry in KUAL.
 
-Optionally, download `bokai-v<x.y.z>-kindle.zip` from the [sidle releases](https://github.com/huangziwei/sidle/releases) and unzip it to `/mnt/us/extensions/bokai/`, then the `.azw3` files will be converted to `.kfx` automatically. This is particularly handy for Kindle Scribe, because KFX is the only format that supports handwritten annotations.
+Optionally, you can download the format converter `bokai` in the [Options] page, with which `.azw3` files will be converted to `.kfx` automatically. This is particularly handy for Kindle Scribe, because KFX is the only format that supports handwritten annotations. If the in-app download doesn't work, download `bokai-v<x.y.z>-kindle.zip` from the [sidle releases](https://github.com/huangziwei/sidle/releases) and unzip it to `/mnt/us/extensions/bokai/`.
 
 A local `./build.sh` stages the same two under `device/`.
 
